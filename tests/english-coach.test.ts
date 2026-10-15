@@ -273,9 +273,17 @@ test('the slider under the prompt shows the level and the goal', async ($, on) =
     const ui = await $.ui.mount({ ...SLIDER, surface })
     expect(await ui.find({ text: ' B1? ' })).toBeDefined()
     expect(await ui.find({ text: 'C1★' })).toBeDefined()
-    expect(await ui.find({ text: ' measuring 0/3' })).toBeDefined()
     await ui.unmount()
   }
+  const terminal = await $.ui.mount({ ...SLIDER, surface: 'terminal' })
+  expect(await terminal.find({ text: 'A1' })).toBeDefined()
+  expect(await terminal.find({ text: ' measuring 0/3' })).toBeDefined()
+  await terminal.unmount()
+  // The desktop cuts the label short, so it draws only B1?─B2─C1★.
+  const desktop = await $.ui.mount({ ...SLIDER, surface: 'desktop' })
+  expect(await desktop.find({ text: 'B2' })).toBeDefined()
+  for (const text of ['A1', 'A2', 'C2', /measuring/]) expect(await desktop.find({ text })).toBeUndefined()
+  await desktop.unmount()
   for (let i = 0; i < 3; i++) {
     await submit($, `I have been trying to understand why this function returns the wrong value ${i}`)
     await w.clock.settle()

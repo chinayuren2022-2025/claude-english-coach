@@ -673,7 +673,12 @@ export const register: Register = on => {
     if (!v?.isOn) return next(e)
 
     const { Text } = $.ui.resolve(e)
-    const marks = SCALE.flatMap((c, i) => {
+    // The desktop cuts the footer label short: there, only the stretch from the level to the goal.
+    const isNarrow = e.surface !== 'terminal'
+    const here = SCALE.indexOf(v.level as never)
+    const goal = v.goalLevel ? SCALE.indexOf(v.goalLevel as never) : -1
+    const shown = isNarrow ? SCALE.slice(Math.min(here, goal < 0 ? here : goal), Math.max(here, goal) + 1) : SCALE
+    const marks = shown.flatMap((c, i) => {
       const isYou = c === v.level
       const isGoal = c === v.goalLevel
       const mark = isYou ? (
@@ -695,7 +700,7 @@ export const register: Register = on => {
         {e.props.modes.length > 0 ? <Text dimColor>{`${e.props.modes.join(' & ')} · `}</Text> : ''}
         <Text dimColor>EN </Text>
         {marks}
-        {v.isMeasuring ? <Text dimColor>{` measuring ${v.samples}/${v.needed}`}</Text> : ''}
+        {v.isMeasuring && !isNarrow ? <Text dimColor>{` measuring ${v.samples}/${v.needed}`}</Text> : ''}
       </Text>
     )
   })

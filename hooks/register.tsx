@@ -335,7 +335,7 @@ const HELP = async ($: EngineInterface, s: Settings) =>
     `/english chinese review        Chinese input becomes an English draft in the box for you to check (default)`,
     `/english chinese auto          Chinese input is translated and sent at once`,
     `/english chinese off           Chinese input is sent as typed`,
-    `/english feedback before       check your English when you press Enter; fix it, or Enter again to send (default)`,
+    `/english feedback before       check your English when you press Enter; the fix goes in the box (default)`,
     `/english feedback after        send at once, show the feedback afterwards`,
     `/english feedback off          no feedback on your English`,
     `/english demo                  show a sample feedback card`,
@@ -404,11 +404,14 @@ const hideLater = ($: EngineInterface, card: Feedback, ms: number) => {
   $.clock.after(ms, () => void update($, feedback, shown => (JSON.stringify(shown) === was ? null : shown)))
 }
 
-const isTab = (key?: { key: string; ctrl?: true; shift?: true; meta?: true }) =>
-  key?.key === 'tab' && !key.ctrl && !key.shift && !key.meta
+// The key that swaps a held message between the fix and the person's own: the engine keeps
+// Tab and the arrows, so a mod sees only typed characters. Backtick, by Tab; a Chinese input
+// method types it as "·".
+const SWAP_KEY = '`'
+const isSwap = (typed: string) => typed === SWAP_KEY || typed === '·'
 
 export const register: Register = on => {
-  // The message last held for fixing: Enter on it again sends it as is.
+  // The text a held message has in the box: Enter on it sends it unchecked.
   let held: string | null = null
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -494,7 +497,16 @@ export const register: Register = on => {
         await publishLevel($, s)
       }
       const card: Feedback | null = r
-        ? { kind: 'checked', original, isNatural: r.isNatural, better: r.better, tips: r.tips, upgrade: r.upgrade, isHeld }
+        ? {
+            kind: 'checked',
+            original,
+            isNatural: r.isNatural,
+            better: r.better,
+            tips: r.tips,
+            upgrade: r.upgrade,
+            isHeld,
+            ...(isHeld ? { inBox: 'better' as const } : {}),
+          }
         : null
       await update($, feedback, shown => (shown?.original !== original ? shown : card))
       if (card && !isHeld) hideLater($, card, HIDE_CHECKED_MS)
@@ -508,7 +520,7 @@ export const register: Register = on => {
       return next(e)
     }
 
-    // Before sending: Enter on a held message again sends it as is.
+    // Before sending: Enter on a held message, the fix or the person's own, sends it unchecked.
     if (held !== null && original.trim() === held.trim()) {
       held = null
       const shown = await read($, feedback)
@@ -526,18 +538,25 @@ export const register: Register = on => {
     await record(r, isHeld)
     if (!isHeld) return next(e)
 
-    held = original
-    $.clock.after(50, () => void $.prompt.fill({ text: original }))
-    return { drop: 'Not sent: see the card above the prompt.' }
+    // The fix goes straight into the box, as a Chinese draft does.
+    const fixed = r.better
+    held = fixed
+    $.clock.after(50, () => void $.prompt.fill({ text: fixed }))
+    return { drop: `Not sent yet: the corrected message is in the box. Enter sends it; ${SWAP_KEY} brings yours back.` }
   })
 
-  // Tab on a held message puts the suggestion in the box; Enter then sends it unchecked.
+  // The swap key on an untouched held message trades the fix and the person's own; Enter sends either unchecked.
   on('prompt.edit', async ($, e, next) => {
-    if (!isTab(e.key) && e.inputText !== '\t') return next(e)
+    if (!isSwap(e.inputText) || e.start !== e.end) return next(e)
     const fb = await read($, feedback)
-    if (fb?.kind !== 'checked' || !fb.isHeld || e.text.trim() !== fb.original.trim()) return next(e)
-    held = fb.better
-    return { text: fb.better, cursor: fb.better.length }
+    if (fb?.kind !== 'checked' || !fb.isHeld) return next(e)
+    const box = e.text.trim()
+    const inBox = box === fb.better.trim() ? 'original' : box === fb.original.trim() ? 'better' : null
+    if (inBox === null) return next(e)
+    const text = inBox === 'better' ? fb.better : fb.original
+    held = text
+    await update($, feedback, (shown): Feedback | null => (shown?.kind === 'checked' && shown.isHeld ? { ...shown, inBox } : shown))
+    return { text, cursor: text.length }
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
@@ -613,8 +632,8 @@ export const register: Register = on => {
 
     return card(
       'yellow',
-      '✎ Almost there',
-      fb.isHeld ? 'Tab: use the suggestion · Enter: send yours as is' : '',
+      fb.isHeld && fb.inBox === 'better' ? '✎ Fixed in the box' : '✎ Almost there',
+      !fb.isHeld ? '' : fb.inBox === 'better' ? `Enter send it · ${SWAP_KEY} back to yours` : `${SWAP_KEY} use the fix · Enter send yours as is`,
       <Box key="diff">
         <Text>
           {diffWords(fb.original, fb.better).map(p =>

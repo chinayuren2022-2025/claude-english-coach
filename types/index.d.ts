@@ -11,8 +11,10 @@ export type Feedback =
       // Short tips in Chinese, one per main mistake.
       tips: string[]
       upgrade: string
-      // True while the message waits in the box for the person to fix it.
+      // True while the message waits in the box for the person to send it.
       isHeld: boolean
+      // Which version a held message has in the box: the fix (the default) or the person's own.
+      inBox?: 'better' | 'original'
     }
 
 // What the level slider under the prompt draws.

@@ -92,8 +92,17 @@ const levelOf = async ($: Engine) => {
 
 // The test engine runs prompt.edit, though its type does not list the call.
 type Edit = { edit: (input: PromptEditInput) => Promise<{ text: string; cursor: number }> }
-const tab = ($: Engine, text: string) =>
-  ($.prompt as unknown as Edit).edit({ origin: { kind: 'composer' }, key: { key: 'tab' }, text, cursor: text.length, start: text.length, end: text.length, inputText: '' })
+// Types one character at the end of the box; a Chinese input method's "·" comes with no key.
+const type = ($: Engine, text: string, typed = '`') =>
+  ($.prompt as unknown as Edit).edit({
+    origin: { kind: 'composer' },
+    ...(typed === '`' ? { key: { key: '`' } } : {}),
+    text,
+    cursor: text.length,
+    start: text.length,
+    end: text.length,
+    inputText: typed,
+  })
 
 const submit = ($: Engine, text: string) =>
   $.prompt.submit({ text, wait: false, origin: { kind: 'composer' } })
@@ -145,55 +154,75 @@ test('Chinese inside code does not trigger translation', async ($, on) => {
   expect(w.sent).toEqual(['What does `console.log("你好")` print?'])
 })
 
-test('a message that needs fixing is held in the box with a suggestion', async ($, on) => {
+const MINE = 'Can you help me to fixing this bug'
+const FIXED = 'Can you help me fix this bug'
+
+test('a message that needs fixing is held, with the fix put in the box', async ($, on) => {
   const w = world(on)
-  const r = await submit($, 'Can you help me to fixing this bug')
-  expect(r.drop).toContain('Not sent')
+  const r = await submit($, MINE)
+  expect(r.drop).toContain('corrected message is in the box')
   expect(w.sent.length).toBe(0)
   await w.clock.advance(100)
-  expect(w.filled).toEqual(['Can you help me to fixing this bug'])
+  expect(w.filled).toEqual([FIXED])
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...BAND, surface })
+    expect(await ui.find({ text: /Fixed in the box/ })).toBeDefined()
     expect(await ui.find({ text: ' to fixing' })).toBeDefined()
     expect(await ui.find({ text: ' fix' })).toBeDefined()
     expect(await ui.find({ text: 'fix 前不用 to' })).toBeDefined()
+    expect(await ui.find({ text: /Enter send it · ` back to yours/ })).toBeDefined()
+    // Style ideas are not fixes.
+    expect(await ui.find({ text: /Could/ })).toBeUndefined()
     await ui.unmount()
   }
-  // Style ideas are not fixes.
-  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect(await ui.find({ text: /Could/ })).toBeUndefined()
-  expect(await ui.find({ text: /Tab: use the suggestion/ })).toBeDefined()
 })
 
-test('Tab puts the suggestion in the box, and Enter sends it without a second check', async ($, on) => {
+test('Enter on the fix sends it without a second check, and the card hides later', async ($, on) => {
   const w = world(on)
-  on('prompt.edit', ($, e) => ({ text: e.text + e.inputText, cursor: e.cursor + e.inputText.length }))
-  await submit($, 'Can you help me to fixing this bug')
-  const box = await tab($, 'Can you help me to fixing this bug')
-  expect(box.text).toBe('Can you help me fix this bug')
+  await submit($, MINE)
   const checks = w.prompts.length
-  await submit($, box.text)
-  expect(w.sent).toEqual(['Can you help me fix this bug'])
+  await submit($, FIXED)
+  expect(w.sent).toEqual([FIXED])
   expect(w.prompts.length).toBe(checks)
-})
-
-test('Tab does nothing special once the person has edited the held message', async ($, on) => {
-  world(on)
-  on('prompt.edit', ($, e) => ({ text: e.text + e.inputText, cursor: e.cursor + e.inputText.length }))
-  await submit($, 'Can you help me to fixing this bug')
-  expect((await tab($, 'Can you help me fixing this bug')).text).toBe('Can you help me fixing this bug')
-})
-
-test('Enter again on the held message sends it as is', async ($, on) => {
-  const w = world(on)
-  await submit($, 'Can you help me to fixing this bug')
-  await submit($, 'Can you help me to fixing this bug')
-  expect(w.sent).toEqual(['Can you help me to fixing this bug'])
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect(await ui.find({ text: /Tab: use/ })).toBeUndefined()
+  expect(await ui.find({ text: /Enter send/ })).toBeUndefined()
   expect(await ui.find({ text: /Almost there/ })).toBeDefined()
   await w.clock.advance(9000)
   expect(await ui.find({ text: /Almost there/ })).toBeUndefined()
+})
+
+test('backtick swaps the box between the fix and the person\'s own, and Enter sends either as it is', async ($, on) => {
+  const w = world(on)
+  on('prompt.edit', ($, e) => ({ text: e.text + e.inputText, cursor: e.cursor + e.inputText.length }))
+  await submit($, MINE)
+  expect((await type($, FIXED)).text).toBe(MINE)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ text: /` use the fix · Enter send yours as is/ })).toBeDefined()
+  expect((await type($, MINE)).text).toBe(FIXED)
+  expect((await type($, FIXED)).text).toBe(MINE)
+  const checks = w.prompts.length
+  await submit($, MINE)
+  expect(w.sent).toEqual([MINE])
+  expect(w.prompts.length).toBe(checks)
+})
+
+test('the Chinese input method\'s · swaps too', async ($, on) => {
+  world(on)
+  on('prompt.edit', ($, e) => ({ text: e.text + e.inputText, cursor: e.cursor + e.inputText.length }))
+  await submit($, MINE)
+  expect((await type($, FIXED, '·')).text).toBe(MINE)
+})
+
+test('backtick types as usual in an edited box, or with nothing held', async ($, on) => {
+  const w = world(on)
+  on('prompt.edit', ($, e) => ({ text: e.text + e.inputText, cursor: e.cursor + e.inputText.length }))
+  expect((await type($, 'Run ')).text).toBe('Run `')
+  await submit($, MINE)
+  expect((await type($, 'Can you help me fixing this bug')).text).toBe('Can you help me fixing this bug`')
+  // An edited message is checked again.
+  const checks = w.prompts.length
+  await submit($, 'Can you help me to fixing this bug now')
+  expect(w.prompts.length).toBe(checks + 1)
 })
 
 test('a natural message is sent at once, with a step up shown', async ($, on) => {
@@ -227,7 +256,7 @@ test('after mode sends at once and shows feedback later', async ($, on) => {
   await w.clock.advance(100)
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ text: ' to fixing' })).toBeDefined()
-  expect(await ui.find({ text: /Tab: use/ })).toBeUndefined()
+  expect(await ui.find({ text: /Enter send|use the fix/ })).toBeUndefined()
   await ui.press({ key: 'hide' })
   expect(await ui.find({ text: /Almost there/ })).toBeUndefined()
 })
@@ -298,7 +327,7 @@ test('/english demo shows a sample card', async ($, on) => {
   await $.command.run({ command: 'english', args: 'demo', origin: { kind: 'composer' } } as never)
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ text: /Almost there/ })).toBeDefined()
-  expect(await ui.find({ text: /Tab: use/ })).toBeDefined()
+  expect(await ui.find({ text: /use the fix/ })).toBeDefined()
 })
 
 const REPLY = 'Make the handler idempotent so a retry is safe.\n\n```js\nconst idempotent = true\n```'

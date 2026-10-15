@@ -7,8 +7,8 @@ Practise English by working with Claude in English only. Made for Chinese-speaki
 ## What it does
 
 - **Claude replies in English only**, at your level, with a few words from one level above. Hard words get a short Chinese gloss: `idempotent（幂等的）`.
-- **Your level is measured automatically** from what you write (CEFR A2–C1), and shown in the status line: `EN ~B2 → IELTS 7.5`.
-- **Check before you send.** When you press Enter, your English is checked first. If it can be better, the message stays in the box and a suggestion shows above the prompt, with a short tip in Chinese. Fix it yourself, press `Use suggestion`, or press Enter again to send it as is.
+- **Your level is measured automatically** from what you write (CEFR A2–C1), and shown as a slider under the prompt, with your goal marked: `EN A1─A2─[B1]─B2─C1★─C2`.
+- **Check before you send.** When you press Enter, your English is checked first. If it can be better, the message stays in the box and a card shows above the prompt: your sentence with the mistakes struck out in red and the fixes in green, and short numbered tips in Chinese. Fix it yourself, press `Use suggestion` (`u`), or press Enter again to send it as is.
 - **Level up.** Even when your English is natural, you get one stronger word or phrase toward your goal: `fix this bug → track down this bug`.
 - **Write in Chinese when you're stuck.** Chinese or mixed input becomes an English draft in the box for you to check, with the key phrases shown: `优化 → optimize`. Start a prompt with `zh:` to send Chinese as typed.
 
@@ -44,6 +44,7 @@ In the desktop app, where `/plugin` does not run: click **+** next to the prompt
 | `/english gloss on\|off` | Chinese glosses after hard words |
 | `/english feedback before\|after\|off` | Check before sending (default), feedback after sending, or none |
 | `/english chinese review\|auto\|off` | Chinese input: draft to check (default), translate and send, or send as typed |
+| `/english demo` | Show a sample feedback card |
 | `/en <text>` | Turn Chinese or rough English into an English draft in the box |
 
 Settings are kept across sessions.

@@ -26,6 +26,8 @@ const BAND = {
   },
 } as const
 
+const SLIDER = { plugin: 'english-coach', component: 'SessionMode', props: { modes: [] } } as const
+
 const world = (on: On, store: Record<string, unknown> = {}) => {
   mock.store(on, store)
   const clock = mock.clock(on)
@@ -52,8 +54,8 @@ const world = (on: On, store: Record<string, unknown> = {}) => {
       text: e.system?.includes('turn a learner')
         ? '{"english": "Please help me fix this bug.", "phrases": [{"zh": "修复", "en": "fix"}]}'
         : e.prompt.includes('This sentence is fine')
-          ? '{"natural": true, "better": "", "tip": "", "upgrade": "fine → spot on", "cefr": "B2"}'
-          : '{"natural": false, "better": "Can you help me fix this bug?", "tip": "help 后面直接接动词原形", "upgrade": "fix this bug → track down this bug", "cefr": "B2"}',
+          ? '{"natural": true, "better": "", "tips": [], "upgrade": "fine → spot on", "cefr": "B2"}'
+          : '{"natural": false, "better": "Can you help me fix this bug?", "tips": ["help 后面直接接动词原形", "fix 前不用 to"], "upgrade": "fix this bug → track down this bug", "cefr": "B2"}',
     }
     return { value }
   })
@@ -112,13 +114,15 @@ test('Chinese inside code does not trigger translation', async ($, on) => {
 test('a message that needs fixing is held in the box with a suggestion', async ($, on) => {
   const w = world(on)
   const r = await submit($, 'Can you help me to fixing this bug')
-  expect(r.drop).toContain('Not sent yet')
+  expect(r.drop).toContain('Not sent')
   expect(w.sent.length).toBe(0)
   await w.clock.advance(100)
   expect(w.filled).toEqual(['Can you help me to fixing this bug'])
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...BAND, surface })
-    expect(await ui.find({ text: 'Can you help me fix this bug? ' })).toBeDefined()
+    expect(await ui.find({ text: ' to fixing' })).toBeDefined()
+    expect(await ui.find({ text: ' fix' })).toBeDefined()
+    expect(await ui.find({ text: 'fix 前不用 to' })).toBeDefined()
     await ui.unmount()
   }
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
@@ -150,10 +154,10 @@ test('after mode sends at once and shows feedback later', async ($, on) => {
   expect(w.sent).toEqual(['Can you help me to fixing this bug'])
   await w.clock.settle()
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect(await ui.find({ text: 'Can you help me fix this bug? ' })).toBeDefined()
+  expect(await ui.find({ text: ' to fixing' })).toBeDefined()
   expect(await ui.find({ key: 'use' })).toBeUndefined()
   await ui.press({ key: 'hide' })
-  expect(await ui.find({ text: /Better/ })).toBeUndefined()
+  expect(await ui.find({ text: /Almost there/ })).toBeUndefined()
 })
 
 test('the band offers a step up toward the goal', async ($, on) => {
@@ -186,4 +190,33 @@ test('short messages do not count toward the level', async ($, on) => {
 test('a fixed level overrides the estimate', async ($, on) => {
   world(on, { settings: { level: 'C1' }, estimates: ['A2', 'A2', 'A2'] })
   expect((await $.prompt.compose(COMPOSE)).sections.at(-1)?.text).toContain('around CEFR C1')
+})
+
+test('the slider under the prompt shows the level and the goal', async ($, on) => {
+  const w = world(on)
+  on('command.register', () => ({ value: {} }) as never)
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...SLIDER, surface })
+    expect(await ui.find({ text: ' B1? ' })).toBeDefined()
+    expect(await ui.find({ text: 'C1★' })).toBeDefined()
+    expect(await ui.find({ text: ' measuring 0/3' })).toBeDefined()
+    await ui.unmount()
+  }
+  for (let i = 0; i < 3; i++) {
+    await submit($, `I have been trying to understand why this function returns the wrong value ${i}`)
+    await w.clock.settle()
+  }
+  const ui = await $.ui.mount({ ...SLIDER, surface: 'terminal' })
+  expect(await ui.find({ text: ' B2 ' })).toBeDefined()
+  expect(await ui.find({ text: /measuring/ })).toBeUndefined()
+})
+
+test('/english demo shows a sample card', async ($, on) => {
+  world(on)
+  await $.command.run({ command: 'english', args: 'demo', origin: { kind: 'composer' } } as never)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ text: /Almost there/ })).toBeDefined()
+  expect(await ui.find({ key: 'use' })).toBeDefined()
 })

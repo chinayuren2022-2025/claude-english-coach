@@ -1,9 +1,10 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, PromptOrigin, Register } from 'claude-code'
+import type { EngineInterface, PromptOrigin, Register, RenderChildren } from 'claude-code'
 
-import type { Feedback, Phrase } from '../types'
+import type { Feedback, LevelView, Phrase } from '../types'
 
 const feedback = atom({ plugin: 'english-coach', key: 'feedback' } as const, null)
+const levelView = atom({ plugin: 'english-coach', key: 'level' } as const, null)
 
 const LEVELS = ['A2', 'B1', 'B2', 'C1'] as const
 type Level = (typeof LEVELS)[number]
@@ -22,11 +23,11 @@ type Settings = {
 
 const DEFAULTS: Settings = { isOn: true, level: 'auto', goal: 'IELTS 7.5', gloss: true, chinese: 'review', checkWhen: 'before' }
 
-// How long a check before sending may hold a message up; past it, the message is sent.
-const HOLD_TIMEOUT_MS = 10_000
-
 // Prefix that sends a prompt as typed, Chinese included.
 const RAW_PREFIX = 'zh:'
+
+// How long a check before sending may hold a message up; past it, the message is sent.
+const HOLD_TIMEOUT_MS = 10_000
 
 // Auto level: the median of the last estimates the feedback check made.
 const ESTIMATES_KEPT = 20
@@ -54,6 +55,30 @@ const currentLevel = async ($: EngineInterface, s: Settings): Promise<Level> => 
   return median === 'A1' ? 'A2' : median === 'C2' ? 'C1' : median
 }
 
+// "IELTS 7.5" → C1, "C1" → C1; null for a goal that names neither.
+const goalLevel = (goal: string): string | null => {
+  const cefr = goal.toUpperCase().match(/\b([ABC][12])\b/)
+  if (cefr?.[1]) return cefr[1]
+  const ielts = goal.match(/ielts\s*(\d+(?:\.\d)?)/i)
+  if (!ielts?.[1]) return null
+  const band = Number(ielts[1])
+  return band >= 8.5 ? 'C2' : band >= 7 ? 'C1' : band >= 5.5 ? 'B2' : band >= 4 ? 'B1' : 'A2'
+}
+
+const publishLevel = async ($: EngineInterface, s: Settings) => {
+  const samples = (await loadEstimates($)).length
+  const view: LevelView = {
+    isOn: s.isOn,
+    level: await currentLevel($, s),
+    isMeasuring: s.level === 'auto' && samples < ESTIMATES_NEEDED,
+    samples: Math.min(samples, ESTIMATES_NEEDED),
+    needed: ESTIMATES_NEEDED,
+    goal: s.goal,
+    goalLevel: goalLevel(s.goal),
+  }
+  await update($, levelView, () => view)
+}
+
 const levelLabel = async ($: EngineInterface, s: Settings) => {
   const level = await currentLevel($, s)
   if (s.level !== 'auto') return level
@@ -61,12 +86,9 @@ const levelLabel = async ($: EngineInterface, s: Settings) => {
   return n < ESTIMATES_NEEDED ? `${level}? (measuring)` : `~${level}`
 }
 
-const showStatus = async ($: EngineInterface, s: Settings) =>
-  $.ui.status(s.isOn ? `EN ${await levelLabel($, s)} → ${s.goal}` : undefined)
-
 const saveSettings = async ($: EngineInterface, s: Settings) => {
   await $.store.set('settings', s)
-  await showStatus($, s)
+  await publishLevel($, s)
 }
 
 const isPerson = (origin: PromptOrigin) =>
@@ -87,6 +109,45 @@ const hasChinese = (text: string) => /[㐀-鿿]/.test(prose(text))
 const wordCount = (text: string) => (prose(text).match(/[A-Za-z]+(?:'[a-z]+)?/g) ?? []).length
 
 const isCheckable = (text: string) => wordCount(text) >= 3 && text.length <= 800
+
+type Piece = { text: string; kind: 'same' | 'del' | 'add' }
+
+const tokenize = (text: string) => text.match(/[\p{L}\p{N}'’-]+|[^\s\p{L}\p{N}]/gu) ?? []
+
+// Word diff of the person's text against the better one, by longest common subsequence.
+const diffWords = (from: string, to: string): Piece[] => {
+  const a = tokenize(from)
+  const b = tokenize(to)
+  const lcs: number[][] = Array.from({ length: a.length + 1 }, () => new Array<number>(b.length + 1).fill(0))
+  for (let i = a.length - 1; i >= 0; i--)
+    for (let j = b.length - 1; j >= 0; j--)
+      lcs[i]![j] = a[i] === b[j] ? lcs[i + 1]![j + 1]! + 1 : Math.max(lcs[i + 1]![j]!, lcs[i]![j + 1]!)
+
+  const pieces: Piece[] = []
+  const push = (text: string, kind: Piece['kind']) => {
+    const last = pieces.at(-1)
+    const glued = /^[,.!?;:)\]}%’]/.test(text) || pieces.length === 0
+    const spaced = glued ? text : ` ${text}`
+    if (last?.kind === kind) last.text += spaced
+    else pieces.push({ text: spaced, kind })
+  }
+  let i = 0
+  let j = 0
+  while (i < a.length || j < b.length) {
+    if (i < a.length && j < b.length && a[i] === b[j]) push(a[i++]!, 'same'), j++
+    else if (j < b.length && (i === a.length || lcs[i]![j + 1]! >= lcs[i + 1]![j]!)) push(b[j++]!, 'add')
+    else push(a[i++]!, 'del')
+  }
+  // A deletion is drawn before the addition that replaces it.
+  for (let k = 0; k + 1 < pieces.length; k++) {
+    if (pieces[k]!.kind === 'add' && pieces[k + 1]!.kind === 'del') {
+      const [add, del] = [pieces[k]!, pieces[k + 1]!]
+      pieces[k] = del
+      pieces[k + 1] = add
+    }
+  }
+  return pieces
+}
 
 const parseJson = (text: string): Record<string, unknown> | null => {
   const start = text.indexOf('{')
@@ -129,19 +190,20 @@ const check = async ($: EngineInterface, text: string, s: Settings, level: Level
     $,
     `You coach a Chinese-speaking English learner, now around CEFR ${level}, whose goal is ${s.goal}. Judge the English of their message (ignore code, paths, commands). ` +
       `If it is clear and natural enough, set "natural" true; ignore casing, a missing final period and other tiny slips. ` +
-      `Otherwise give the most natural version that keeps their meaning and words where possible, and one short tip in Simplified Chinese about the main mistake. ` +
+      `Otherwise give the most natural version that keeps their meaning and words where possible, and up to 3 tips in Simplified Chinese, one per main mistake, each under 30 characters. ` +
       `Whether natural or not, offer one "upgrade": a more precise or higher-level word, collocation or structure that a ${s.goal} candidate would use for part of the message, written "plain → better" (empty if nothing fits). ` +
       `Also estimate the CEFR level (A1, A2, B1, B2, C1 or C2) this message shows. ` +
-      `Reply with JSON only: {"natural": true|false, "better": "<improved message, or empty>", "tip": "<中文提示, or empty>", "upgrade": "<plain → better, or empty>", "cefr": "<level>"}`,
+      `Reply with JSON only: {"natural": true|false, "better": "<improved message, or empty>", "tips": ["<中文提示>"], "upgrade": "<plain → better, or empty>", "cefr": "<level>"}`,
     text,
     timeoutMs,
   )
   if (!json || typeof json.natural !== 'boolean') return null
   const str = (v: unknown) => (typeof v === 'string' ? v.trim() : '')
+  const tips = Array.isArray(json.tips) ? json.tips.map(str).filter(Boolean).slice(0, 3) : [str(json.tip)].filter(Boolean)
   return {
     isNatural: json.natural,
     better: str(json.better),
-    tip: str(json.tip),
+    tips,
     upgrade: str(json.upgrade),
     cefr: str(json.cefr).toUpperCase(),
   }
@@ -177,9 +239,20 @@ const HELP = async ($: EngineInterface, s: Settings) =>
     `/english feedback before       check your English when you press Enter; fix it, or Enter again to send (default)`,
     `/english feedback after        send at once, show the feedback afterwards`,
     `/english feedback off          no feedback on your English`,
+    `/english demo                  show a sample feedback card`,
     `/en <text>                     turn Chinese or rough English into an English draft in the box`,
     `Start a prompt with "${RAW_PREFIX}" to send it as typed.`,
   ].join('\n')
+
+const DEMO: Feedback = {
+  kind: 'checked',
+  isNatural: false,
+  original: 'The 135 score is in college entrance exam, and i made a mistake. The suggestions only shows when the message is send.',
+  better: 'The 135 score is from the college entrance exam, and I made a mistake. The suggestions only appear when the message is sent.',
+  tips: ['表示来源用 from，不用 in', 'suggestions 是复数，动词用 appear', '被动语态：is sent，不是 is send'],
+  upgrade: 'only appear when → only show up once',
+  isHeld: true,
+}
 
 const applyArgs = (s: Settings, args: string): Settings | string => {
   const trimmed = args.trim()
@@ -212,20 +285,26 @@ export const register: Register = on => {
     await $.command.register({
       name: 'english',
       description: 'English coach: show or change its settings',
-      argumentHint: '[on|off|level auto|goal IELTS 7.5|gloss on|chinese review|feedback on]',
+      argumentHint: '[on|off|level auto|goal IELTS 7.5|gloss on|chinese review|feedback before|demo]',
     })
     await $.command.register({
       name: 'en',
       description: 'Turn Chinese or rough English into an English draft in the prompt box',
       argumentHint: '<text>',
     })
-    await showStatus($, await loadSettings($))
+    // The level is drawn under the prompt now; clear the status line of earlier versions.
+    $.ui.status(undefined)
+    await publishLevel($, await loadSettings($))
     return next(e)
   })
 
   on('command.run', { command: 'english' }, async ($, e) => {
     const s = await loadSettings($)
     if (!e.args.trim()) return { text: await HELP($, s) }
+    if (e.args.trim().toLowerCase() === 'demo') {
+      await update($, feedback, () => DEMO)
+      return { text: 'A sample feedback card is above the prompt. Press ✕ to close it.' }
+    }
     const changed = applyArgs(s, e.args)
     if (typeof changed === 'string') return { text: `${changed}\n\n${await HELP($, s)}` }
     await saveSettings($, changed)
@@ -270,7 +349,7 @@ export const register: Register = on => {
       await update($, feedback, (): Feedback => ({ kind: 'translated', original: e.text, ...t }))
       if (s.chinese === 'auto') return next({ ...e, text: t.english })
       $.clock.after(50, () => void $.prompt.fill({ text: t.english }))
-      return { drop: `English draft is in the box: check it, then press Enter. (Start with "${RAW_PREFIX}" to send Chinese as typed.)` }
+      return { drop: `Not sent: your English draft is in the box. (Start with "${RAW_PREFIX}" to send Chinese as typed.)` }
     }
 
     if (s.checkWhen === 'off' || !isCheckable(e.text)) return next(e)
@@ -279,13 +358,13 @@ export const register: Register = on => {
     const record = async (r: Awaited<ReturnType<typeof check>>, isHeld: boolean) => {
       if (r && wordCount(original) >= WORDS_TO_ESTIMATE) {
         await addEstimate($, r.cefr)
-        await showStatus($, s)
+        await publishLevel($, s)
       }
       await update($, feedback, (shown): Feedback | null =>
         shown?.original !== original
           ? shown
           : r
-            ? { kind: 'checked', original, isNatural: r.isNatural, better: r.better, tip: r.tip, upgrade: r.upgrade, isHeld }
+            ? { kind: 'checked', original, isNatural: r.isNatural, better: r.better, tips: r.tips, upgrade: r.upgrade, isHeld }
             : null,
       )
     }
@@ -314,7 +393,7 @@ export const register: Register = on => {
 
     held = original
     $.clock.after(50, () => void $.prompt.fill({ text: original }))
-    return { drop: 'Not sent yet: see the suggestion above the prompt. Fix your message, or press Enter to send it as is.' }
+    return { drop: 'Not sent: see the card above the prompt.' }
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
@@ -324,53 +403,133 @@ export const register: Register = on => {
     const { Box, Button, Text } = $.ui.resolve(e)
     const hide = <Button key="hide" plain label="✕" onPress={() => update($, feedback, () => null)} />
 
+    const card = (color: string, title: string, ...body: RenderChildren[]) => (
+      <Box key="card" flexDirection="column" borderStyle="round" borderColor={color} paddingX={1}>
+        <Box justifyContent="space-between">
+          <Text color={color} bold>
+            {title}
+          </Text>
+          {hide}
+        </Box>
+        {body.filter(Boolean)}
+      </Box>
+    )
+
     if (fb.kind === 'pending') {
       return <Text dimColor>✎ Checking your English…</Text>
     }
 
     if (fb.kind === 'translated') {
-      return (
-        <Box flexDirection="column">
-          <Box>
-            <Text color="cyan">中→EN </Text>
-            <Text>{fb.english} </Text>
-            {hide}
+      return card(
+        'cyan',
+        '中 → EN   Your English draft is in the box',
+        <Box marginTop={1}>
+          <Text>{fb.english}</Text>
+        </Box>,
+        fb.phrases.length > 0 && (
+          <Box key="phrases" flexDirection="column" marginTop={1}>
+            {fb.phrases.map(p => (
+              <Text>
+                <Text dimColor>• </Text>
+                {p.zh}
+                <Text dimColor> → </Text>
+                <Text color="cyan">{p.en}</Text>
+              </Text>
+            ))}
           </Box>
-          {fb.phrases.length > 0 && (
-            <Text dimColor>{fb.phrases.map(p => `${p.zh} → ${p.en}`).join('   ')}</Text>
-          )}
-        </Box>
+        ),
+        <Box marginTop={1}>
+          <Text dimColor>Edit it, then press Enter to send.</Text>
+        </Box>,
       )
     }
 
-    return (
-      <Box flexDirection="column">
-        {fb.isNatural ? (
-          <Box>
-            <Text color="green">✓ Natural English. </Text>
-            {hide}
-          </Box>
-        ) : (
-          <Box>
-            <Text color="yellow">✎ Better: </Text>
-            <Text>{fb.better} </Text>
-            {hide}
-          </Box>
-        )}
-        {!fb.isNatural && fb.tip !== '' && <Text dimColor>  {fb.tip}</Text>}
-        {fb.isHeld && (
-          <Box>
-            <Button key="use" hotkey="u" label="Use suggestion" onPress={() => void $.prompt.fill({ text: fb.better })} />
-            <Text dimColor> or fix it yourself · Enter on your own text sends it as is</Text>
-          </Box>
-        )}
-        {fb.upgrade !== '' && (
-          <Box>
-            <Text color="magenta">↑ Level up: </Text>
-            <Text>{fb.upgrade}</Text>
-          </Box>
-        )}
+    const upgrade = fb.upgrade !== '' && (
+      <Box key="upgrade" marginTop={fb.isNatural ? 1 : 0}>
+        <Text>
+          <Text color="magenta" bold>
+            ↑{' '}
+          </Text>
+          {fb.upgrade}
+        </Text>
       </Box>
+    )
+
+    if (fb.isNatural) {
+      return card('green', '✓ Natural English', upgrade)
+    }
+
+    return card(
+      'yellow',
+      '✎ Almost there',
+      <Box key="diff" marginTop={1}>
+        <Text>
+          {diffWords(fb.original, fb.better).map(p =>
+            p.kind === 'same' ? (
+              p.text
+            ) : p.kind === 'del' ? (
+              <Text color="red" strikethrough>
+                {p.text}
+              </Text>
+            ) : (
+              <Text color="green" bold>
+                {p.text}
+              </Text>
+            ),
+          )}
+        </Text>
+      </Box>,
+      fb.tips.length > 0 && (
+        <Box key="tips" flexDirection="column" marginTop={1}>
+          {fb.tips.map((tip, i) => (
+            <Text>
+              {i === 0 ? '💡 ' : '   '}
+              {fb.tips.length > 1 ? <Text dimColor>{i + 1}. </Text> : ''}
+              {tip}
+            </Text>
+          ))}
+        </Box>
+      ),
+      upgrade,
+      fb.isHeld && (
+        <Box key="actions" marginTop={1}>
+          <Button key="use" hotkey="u" variant="primary" label="Use suggestion" onPress={() => void $.prompt.fill({ text: fb.better })} />
+          <Text dimColor>   or fix it yourself · Enter on your own text sends it as is</Text>
+        </Box>
+      ),
+    )
+  })
+
+  // The level slider, at the right of the footer under the prompt.
+  on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
+    const v = await read($, levelView)
+    if (!v?.isOn) return next(e)
+
+    const { Text } = $.ui.resolve(e)
+    const marks = SCALE.flatMap((c, i) => {
+      const isYou = c === v.level
+      const isGoal = c === v.goalLevel
+      const mark = isYou ? (
+        <Text color="cyan" bold inverse>
+          {` ${c}${v.isMeasuring ? '?' : ''}${isGoal ? '★' : ''} `}
+        </Text>
+      ) : isGoal ? (
+        <Text color="magenta" bold>
+          {`${c}★`}
+        </Text>
+      ) : (
+        <Text dimColor>{c}</Text>
+      )
+      return i === 0 ? [mark] : [<Text dimColor>─</Text>, mark]
+    })
+
+    return (
+      <Text>
+        {e.props.modes.length > 0 ? <Text dimColor>{`${e.props.modes.join(' & ')} · `}</Text> : ''}
+        <Text dimColor>EN </Text>
+        {marks}
+        {v.isMeasuring ? <Text dimColor>{` measuring ${v.samples}/${v.needed}`}</Text> : ''}
+      </Text>
     )
   })
 }

@@ -1,0 +1,16 @@
+{
+  "name": "claude-english-coach",
+  "owner": {
+    "name": "chinayuren2022-2025"
+  },
+  "metadata": {
+    "description": "English Coach: practise English by working with Claude Code in English only."
+  },
+  "plugins": [
+    {
+      "name": "english-coach",
+      "source": "./",
+      "description": "Practise English by talking to Claude in English only, with Chinese glosses, Chinese-to-English drafts and a check before you send."
+    }
+  ]
+}

@@ -1,8 +1,8 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
-import type { ModelCompleteResult, On, PromptComposeInput, RenderElement } from 'claude-code'
+import type { ModelCompleteResult, On, PromptComposeInput, PromptEditInput, RenderElement } from 'claude-code'
 
-import { diffWords } from '../hooks/register'
+import { applyFixes, diffWords } from '../hooks/register'
 
 const USAGE = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 
@@ -69,25 +69,42 @@ const world = (on: On, store: Record<string, unknown> = {}) => {
       text: e.system?.includes('turn a learner')
         ? '{"english": "Please help me fix this bug.", "phrases": [{"zh": "修复", "en": "fix"}]}'
         : e.prompt.includes('This sentence is fine')
-          ? '{"natural": true, "better": "", "tips": [], "upgrade": "fine → spot on", "cefr": "B2"}'
-          : '{"natural": false, "better": "Can you help me fix this bug?", "tips": ["help 后面直接接动词原形", "fix 前不用 to"], "upgrade": "fix this bug → track down this bug", "cefr": "B2"}',
+          ? '{"errors": [{"wrong": "is fine", "right": "is fine", "type": "grammar", "tip": "不用改"}], "upgrade": "fine → spot on", "cefr": "B2"}'
+          : JSON.stringify({
+              errors: [
+                { wrong: 'help me to fixing', right: 'help me fix', type: 'grammar', tip: 'fix 前不用 to' },
+                { wrong: 'Can you', right: 'Could you', type: 'style', tip: '更礼貌' },
+              ],
+              upgrade: 'fix this bug → track down this bug',
+              cefr: 'B2',
+            }),
     }
     return { value }
   })
   return { clock, filled, sent, prompts, drawn }
 }
 
+// The level as /english reports it.
+const levelOf = async ($: Engine) => {
+  const r = (await $.command.run({ command: 'english', args: '', origin: { kind: 'composer' } } as never)) as { text: string }
+  return r.text.split(' · ')[1] ?? ''
+}
+
+// The test engine runs prompt.edit, though its type does not list the call.
+type Edit = { edit: (input: PromptEditInput) => Promise<{ text: string; cursor: number }> }
+const tab = ($: Engine, text: string) =>
+  ($.prompt as unknown as Edit).edit({ origin: { kind: 'composer' }, key: { key: 'tab' }, text, cursor: text.length, start: text.length, end: text.length, inputText: '' })
+
 const submit = ($: Engine, text: string) =>
   $.prompt.submit({ text, wait: false, origin: { kind: 'composer' } })
 
-test('adds the English-only section to the system prompt', async ($, on) => {
+test('the system prompt asks for English and nothing else', async ($, on) => {
   world(on)
   const { sections } = await $.prompt.compose(COMPOSE)
   const mine = sections.find(s => s.id === 'english-coach:mode')
   expect(mine?.text).toContain('Write every reply in English')
-  expect(mine?.text).toContain('B1')
-  // Glosses are drawn afterwards, so the prompt asks Claude for none.
-  expect(mine?.text).not.toContain('（')
+  // Feedback and glosses happen after the reply, so Claude is told nothing about them.
+  for (const word of ['learner', 'translation', 'gloss', 'feedback', 'B1', 'IELTS']) expect(mine?.text).not.toContain(word)
 })
 
 test('leaves the system prompt alone when switched off', async ($, on) => {
@@ -142,9 +159,29 @@ test('a message that needs fixing is held in the box with a suggestion', async (
     expect(await ui.find({ text: 'fix 前不用 to' })).toBeDefined()
     await ui.unmount()
   }
+  // Style ideas are not fixes.
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  await ui.press({ key: 'use' })
-  expect(w.filled.at(-1)).toBe('Can you help me fix this bug?')
+  expect(await ui.find({ text: /Could/ })).toBeUndefined()
+  expect(await ui.find({ text: /Tab: use the suggestion/ })).toBeDefined()
+})
+
+test('Tab puts the suggestion in the box, and Enter sends it without a second check', async ($, on) => {
+  const w = world(on)
+  on('prompt.edit', ($, e) => ({ text: e.text + e.inputText, cursor: e.cursor + e.inputText.length }))
+  await submit($, 'Can you help me to fixing this bug')
+  const box = await tab($, 'Can you help me to fixing this bug')
+  expect(box.text).toBe('Can you help me fix this bug')
+  const checks = w.prompts.length
+  await submit($, box.text)
+  expect(w.sent).toEqual(['Can you help me fix this bug'])
+  expect(w.prompts.length).toBe(checks)
+})
+
+test('Tab does nothing special once the person has edited the held message', async ($, on) => {
+  world(on)
+  on('prompt.edit', ($, e) => ({ text: e.text + e.inputText, cursor: e.cursor + e.inputText.length }))
+  await submit($, 'Can you help me to fixing this bug')
+  expect((await tab($, 'Can you help me fixing this bug')).text).toBe('Can you help me fixing this bug')
 })
 
 test('Enter again on the held message sends it as is', async ($, on) => {
@@ -153,7 +190,10 @@ test('Enter again on the held message sends it as is', async ($, on) => {
   await submit($, 'Can you help me to fixing this bug')
   expect(w.sent).toEqual(['Can you help me to fixing this bug'])
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect(await ui.find({ key: 'use' })).toBeUndefined()
+  expect(await ui.find({ text: /Tab: use/ })).toBeUndefined()
+  expect(await ui.find({ text: /Almost there/ })).toBeDefined()
+  await w.clock.advance(9000)
+  expect(await ui.find({ text: /Almost there/ })).toBeUndefined()
 })
 
 test('a natural message is sent at once, with a step up shown', async ($, on) => {
@@ -163,16 +203,31 @@ test('a natural message is sent at once, with a step up shown', async ($, on) =>
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ text: /Natural English/ })).toBeDefined()
   expect(await ui.find({ text: 'fine → spot on' })).toBeDefined()
+  await w.clock.advance(9000)
+  expect(await ui.find({ text: /Natural English/ })).toBeUndefined()
+})
+
+test('a message with an image is sent at once and checked afterwards', async ($, on) => {
+  const w = world(on)
+  await $.prompt.submit({
+    text: '[Image #1] Can you help me to fixing this bug',
+    wait: false,
+    origin: { kind: 'composer' },
+    attachments: [{ type: 'image', mediaType: 'image/png' }],
+  })
+  expect(w.sent).toEqual(['[Image #1] Can you help me to fixing this bug'])
+  await w.clock.advance(100)
+  expect(w.prompts.at(-1)).not.toContain('[Image #1]')
 })
 
 test('after mode sends at once and shows feedback later', async ($, on) => {
   const w = world(on, { settings: { checkWhen: 'after' } })
   await submit($, 'Can you help me to fixing this bug')
   expect(w.sent).toEqual(['Can you help me to fixing this bug'])
-  await w.clock.settle()
+  await w.clock.advance(100)
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ text: ' to fixing' })).toBeDefined()
-  expect(await ui.find({ key: 'use' })).toBeUndefined()
+  expect(await ui.find({ text: /Tab: use/ })).toBeUndefined()
   await ui.press({ key: 'hide' })
   expect(await ui.find({ text: /Almost there/ })).toBeUndefined()
 })
@@ -187,12 +242,12 @@ test('the band offers a step up toward the goal', async ($, on) => {
 
 test('auto level starts at B1 and follows what the person writes', async ($, on) => {
   const w = world(on)
-  expect((await $.prompt.compose(COMPOSE)).sections.at(-1)?.text).toContain('around CEFR B1, aiming for IELTS 7.5')
+  expect(await levelOf($)).toBe('level B1? (measuring)')
   for (let i = 0; i < 3; i++) {
     await submit($, `I have been trying to understand why this function returns the wrong value ${i}`)
     await w.clock.settle()
   }
-  expect((await $.prompt.compose(COMPOSE)).sections.at(-1)?.text).toContain('around CEFR B2')
+  expect(await levelOf($)).toBe('level ~B2')
 })
 
 test('short messages do not count toward the level', async ($, on) => {
@@ -201,12 +256,12 @@ test('short messages do not count toward the level', async ($, on) => {
     await submit($, 'fix it please')
     await w.clock.settle()
   }
-  expect((await $.prompt.compose(COMPOSE)).sections.at(-1)?.text).toContain('around CEFR B1')
+  expect(await levelOf($)).toBe('level B1? (measuring)')
 })
 
 test('a fixed level overrides the estimate', async ($, on) => {
   world(on, { settings: { level: 'C1' }, estimates: ['A2', 'A2', 'A2'] })
-  expect((await $.prompt.compose(COMPOSE)).sections.at(-1)?.text).toContain('around CEFR C1')
+  expect(await levelOf($)).toBe('level C1')
 })
 
 test('the slider under the prompt shows the level and the goal', async ($, on) => {
@@ -235,7 +290,7 @@ test('/english demo shows a sample card', async ($, on) => {
   await $.command.run({ command: 'english', args: 'demo', origin: { kind: 'composer' } } as never)
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ text: /Almost there/ })).toBeDefined()
-  expect(await ui.find({ key: 'use' })).toBeDefined()
+  expect(await ui.find({ text: /Tab: use/ })).toBeDefined()
 })
 
 const REPLY = 'Make the handler idempotent so a retry is safe.\n\n```js\nconst idempotent = true\n```'
@@ -281,4 +336,17 @@ test('a changed run is drawn whole: struck words, then their replacement', () =>
     if (pieces[k]?.kind === 'del' && pieces[k + 1]?.kind === 'add') expect(pieces[k + 1]?.text.startsWith(' ')).toBe(true)
   }
   expect(pieces.filter(p => p.kind === 'same').map(p => p.text).join('')).toContain('how do you')
+})
+
+test('only real, exactly quoted fixes are applied', () => {
+  const text = 'Please make the change after you read it, i think it works'
+  const r = applyFixes(text, [
+    { wrong: 'you read', right: 'I read', type: 'grammar', tip: '主语错' },
+    { wrong: 'make the change', right: 'make changes', type: 'style', tip: '' },
+    { wrong: 'not in the text', right: 'x', type: 'grammar', tip: '' },
+    { wrong: 'i think', right: 'I think', type: 'grammar', tip: '大写' },
+    { wrong: 'it works', right: 'it work', type: 'grammar', tip: '三单' },
+  ])
+  expect(r.fixes.map(f => f.tip)).toEqual(['三单'])
+  expect(r.better).toBe('Please make the change after you read it, i think it work')
 })

@@ -35,6 +35,10 @@ const RAW_PREFIX = 'zh:'
 // How long a check before sending may hold a message up; past it, the message is sent.
 const HOLD_TIMEOUT_MS = 10_000
 
+// How long a card stays once nothing waits on it: a checked message, an English draft.
+const HIDE_CHECKED_MS = 8_000
+const HIDE_DRAFT_MS = 20_000
+
 // Auto level: the median of the last estimates the feedback check made.
 const ESTIMATES_KEPT = 20
 const ESTIMATES_NEEDED = 3
@@ -102,11 +106,15 @@ const isPerson = (origin: PromptOrigin) =>
   origin.kind === 'bridge' ||
   (origin.kind === 'plugin' && origin.asUser === true && origin.name !== 'english-coach')
 
-// Code, inline code, URLs and paths are not the person's prose.
+// Placeholders the box puts in for pasted images and long pastes.
+const PLACEHOLDERS = /\[(?:Image|Pasted text) #\d+[^\]]*\]/g
+
+// Code, inline code, URLs, paths and placeholders are not the person's prose.
 const prose = (text: string) =>
   text
     .replace(/```[\s\S]*?```/g, ' ')
     .replace(/`[^`]*`/g, ' ')
+    .replace(PLACEHOLDERS, ' ')
     .replace(/https?:\/\/\S+/g, ' ')
     .replace(/\S*[\/\\]\S*/g, ' ')
 
@@ -208,45 +216,70 @@ const lastReply = async ($: EngineInterface) => {
   }
 }
 
+// Words that say who does what: a fix must not change them.
+const PERSONS = /\b(i|me|my|mine|you|your|yours|we|us|our|ours|he|him|his|she|her|they|them|their)\b/gi
+const persons = (t: string) => (t.match(PERSONS) ?? []).map(w => w.toLowerCase()).join(' ')
+const bare = (t: string) => t.toLowerCase().replace(/[\s.,!?;:'"’]/g, '')
+
+export type Fix = { wrong: string; right: string; tip: string }
+
+// The model's fixes the mod trusts: each a real error, quoted exactly, changing more
+// than casing or punctuation and never who does what. Applied left to right, no overlaps.
+export const applyFixes = (text: string, raw: unknown) => {
+  const str = (v: unknown) => (typeof v === 'string' ? v : '')
+  const candidates = (Array.isArray(raw) ? raw : [])
+    .map((f: any) => ({ wrong: str(f?.wrong), right: str(f?.right), tip: str(f?.tip).trim(), type: str(f?.type).toLowerCase() }))
+    .filter(f => f.wrong.trim() !== '' && f.type !== 'style' && text.includes(f.wrong))
+    .filter(f => bare(f.wrong) !== bare(f.right) && persons(f.wrong) === persons(f.right))
+    .map(f => ({ ...f, at: text.indexOf(f.wrong) }))
+    .sort((x, y) => x.at - y.at)
+
+  const fixes: Fix[] = []
+  let better = ''
+  let from = 0
+  for (const f of candidates) {
+    if (f.at < from) continue
+    better += text.slice(from, f.at) + f.right
+    from = f.at + f.wrong.length
+    fixes.push({ wrong: f.wrong, right: f.right, tip: f.tip })
+  }
+  return { better: better + text.slice(from), fixes }
+}
+
 const check = async ($: EngineInterface, text: string, s: Settings, level: Level, timeoutMs?: number) => {
   const context = await lastReply($)
+  const message = text.replace(PLACEHOLDERS, '').trim()
   const json = await ask(
     $,
-    `You coach a Chinese-speaking English learner, now around CEFR ${level}, whose goal is ${s.goal}. They are chatting with an AI assistant, Claude, ` +
-      `and you judge the English of the message they are about to send it (ignore code, paths, commands). In their message "you" is Claude and "I" is the learner. ` +
-      `You may be shown Claude's previous reply, only so you understand what they mean; never judge it. ` +
-      `"better" fixes real errors only: grammar, a wrong word, a collocation a native reader would stumble on. Make the smallest edit that fixes each one. ` +
-      `Never change the meaning, who does what (I, you, we), the question asked, names, facts or tone, and never paraphrase, merge or split a sentence that is already correct. ` +
-      `If there is no real error, set "natural" true, even if it could be more elegant: style ideas belong in "upgrade". Ignore casing, a missing final period and other tiny slips. ` +
-      `For each real error give a tip in Simplified Chinese, at most 3, each under 30 characters. ` +
-      `Whether natural or not, offer one "upgrade": a more precise or higher-level word, collocation or structure that a ${s.goal} candidate would use for part of the message, written "plain → better" (empty if nothing fits). ` +
-      `Also estimate the CEFR level (A1, A2, B1, B2, C1 or C2) this message shows. ` +
-      `Reply with JSON only: {"natural": true|false, "better": "<improved message, or empty>", "tips": ["<中文提示>"], "upgrade": "<plain → better, or empty>", "cefr": "<level>"}`,
-    (context ? `Claude's previous reply (context only):\n\"\"\"\n${context}\n\"\"\"\n\n` : '') +
-      `The learner's message to judge:\n\"\"\"\n${text}\n\"\"\"`,
+    `You check the English of a message a Chinese-speaking learner (around CEFR ${level}, goal ${s.goal}) is about to send to an AI assistant, Claude. ` +
+      `In it "you" is Claude and "I" is the learner. Ignore code, paths and commands. Claude's previous reply may be shown so you know what they mean; never judge it. ` +
+      `List only real errors: wrong grammar, a wrong word, a misspelling, or a collocation a native reader would stumble on. ` +
+      `Do not list what is merely less elegant, casing, punctuation or a missing final period. If the message reads fine, list nothing. ` +
+      `For each error: "wrong" is the shortest span copied character for character from the message, "right" is that span corrected with the smallest change, ` +
+      `keeping the meaning and who does what; "type" is grammar, word, spelling or collocation; "tip" says why in Simplified Chinese, under 30 characters, and must be true of this message. ` +
+      `Separately, give one "upgrade": a more precise or higher-level word, collocation or structure a ${s.goal} candidate would use for part of the message, written "plain → better" (empty if nothing fits). ` +
+      `Estimate the CEFR level (A1, A2, B1, B2, C1 or C2) the message shows. ` +
+      `Reply with JSON only: {"errors": [{"wrong": "<exact span>", "right": "<fix>", "type": "<type>", "tip": "<中文>"}], "upgrade": "<plain → better, or empty>", "cefr": "<level>"}`,
+    (context ? `Claude's previous reply (context only):\n"""\n${context}\n"""\n\n` : '') +
+      `The learner's message to check:\n"""\n${message}\n"""`,
     timeoutMs,
   )
-  if (!json || typeof json.natural !== 'boolean') return null
-  const str = (v: unknown) => (typeof v === 'string' ? v.trim() : '')
-  const tips = Array.isArray(json.tips) ? json.tips.map(str).filter(Boolean).slice(0, 3) : [str(json.tip)].filter(Boolean)
+  if (!json || !Array.isArray(json.errors)) return null
+  const { better, fixes } = applyFixes(text, json.errors)
   return {
-    isNatural: json.natural,
-    better: str(json.better),
-    tips,
-    upgrade: str(json.upgrade),
-    cefr: str(json.cefr).toUpperCase(),
+    isNatural: fixes.length === 0,
+    better: fixes.length === 0 ? '' : better,
+    tips: fixes.map(f => f.tip).filter(Boolean).slice(0, 3),
+    upgrade: typeof json.upgrade === 'string' ? json.upgrade.trim() : '',
+    cefr: typeof json.cefr === 'string' ? json.cefr.trim().toUpperCase() : '',
   }
 }
 
-// Kept light on purpose: glosses are added to the drawing afterwards, so Claude's
-// own writing carries no learner rules beyond the language it writes in.
-const systemSection = (s: Settings, level: Level) =>
+// Only the language Claude writes in: everything else the mod does after the reply.
+const systemSection = () =>
   [
-    `# English learning mode`,
-    `The person is a Chinese-speaking English learner (around CEFR ${level}, aiming for ${s.goal}) practising English with you.`,
-    `- Write every reply in English, even when they write in Chinese. Code, commands and quoted text stay as they are.`,
-    `- Where it costs nothing in accuracy, prefer clear, plain wording.`,
-    `- A separate tool gives them feedback on their English and glosses hard words in your replies; do not correct their English or add translations unless they ask.`,
+    `# English`,
+    `Write every reply in English, even when the person writes in Chinese. Code, commands and quoted text stay as they are.`,
   ].join('\n')
 
 const pickGlosses = async ($: EngineInterface, text: string, level: Level, s: Settings, known: string[]): Promise<Gloss[]> => {
@@ -365,6 +398,15 @@ const glossNewBlocks = async ($: EngineInterface) => {
   }
 }
 
+// Hides the card later, unless another one has taken its place by then.
+const hideLater = ($: EngineInterface, card: Feedback, ms: number) => {
+  const was = JSON.stringify(card)
+  $.clock.after(ms, () => void update($, feedback, shown => (JSON.stringify(shown) === was ? null : shown)))
+}
+
+const isTab = (key?: { key: string; ctrl?: true; shift?: true; meta?: true }) =>
+  key?.key === 'tab' && !key.ctrl && !key.shift && !key.meta
+
 export const register: Register = on => {
   // The message last held for fixing: Enter on it again sends it as is.
   let held: string | null = null
@@ -405,7 +447,9 @@ export const register: Register = on => {
     const s = await loadSettings($)
     const t = await translate($, text, await currentLevel($, s))
     if (!t) return { text: 'Could not make an English draft just now. Try again.' }
-    await update($, feedback, (): Feedback => ({ kind: 'translated', original: text, ...t }))
+    const card: Feedback = { kind: 'translated', original: text, ...t }
+    await update($, feedback, () => card)
+    hideLater($, card, HIDE_DRAFT_MS)
     $.clock.after(50, () => void $.prompt.fill({ text: t.english }))
     return { text: 'English draft is in the prompt box: edit it, then press Enter.' }
   })
@@ -414,7 +458,7 @@ export const register: Register = on => {
     const composed = await next(e)
     const s = await loadSettings($)
     if (!s.isOn) return composed
-    const section = { id: 'english-coach:mode', text: systemSection(s, await currentLevel($, s)), scope: 'session' as const }
+    const section = { id: 'english-coach:mode', text: systemSection(), scope: 'session' as const }
     return { sections: [...composed.sections, section] }
   })
 
@@ -433,7 +477,9 @@ export const register: Register = on => {
         $.ui.toast('English coach: translation failed, sent as typed.')
         return next(e)
       }
-      await update($, feedback, (): Feedback => ({ kind: 'translated', original: e.text, ...t }))
+      const card: Feedback = { kind: 'translated', original: e.text, ...t }
+      await update($, feedback, () => card)
+      hideLater($, card, HIDE_DRAFT_MS)
       if (s.chinese === 'auto') return next({ ...e, text: t.english })
       $.clock.after(50, () => void $.prompt.fill({ text: t.english }))
       return { drop: `Not sent: your English draft is in the box. (Start with "${RAW_PREFIX}" to send Chinese as typed.)` }
@@ -447,16 +493,15 @@ export const register: Register = on => {
         await addEstimate($, r.cefr)
         await publishLevel($, s)
       }
-      await update($, feedback, (shown): Feedback | null =>
-        shown?.original !== original
-          ? shown
-          : r
-            ? { kind: 'checked', original, isNatural: r.isNatural, better: r.better, tips: r.tips, upgrade: r.upgrade, isHeld }
-            : null,
-      )
+      const card: Feedback | null = r
+        ? { kind: 'checked', original, isNatural: r.isNatural, better: r.better, tips: r.tips, upgrade: r.upgrade, isHeld }
+        : null
+      await update($, feedback, shown => (shown?.original !== original ? shown : card))
+      if (card && !isHeld) hideLater($, card, HIDE_CHECKED_MS)
     }
 
-    if (s.checkWhen === 'after') {
+    // A message with images is never held: filling the box again would lose them.
+    if (s.checkWhen === 'after' || (e.attachments?.length ?? 0) > 0) {
       await update($, feedback, (): Feedback => ({ kind: 'pending', original }))
       // Off the dispatch, so the turn is not held up by the check.
       $.clock.after(0, async () => record(await check($, original, s, level), false))
@@ -466,9 +511,12 @@ export const register: Register = on => {
     // Before sending: Enter on a held message again sends it as is.
     if (held !== null && original.trim() === held.trim()) {
       held = null
-      await update($, feedback, (shown): Feedback | null =>
-        shown?.kind === 'checked' && shown.isHeld ? { ...shown, isHeld: false } : shown,
-      )
+      const shown = await read($, feedback)
+      if (shown?.kind === 'checked' && shown.isHeld) {
+        const card: Feedback = { ...shown, isHeld: false }
+        await update($, feedback, () => card)
+        hideLater($, card, HIDE_CHECKED_MS)
+      }
       return next(e)
     }
 
@@ -483,6 +531,15 @@ export const register: Register = on => {
     return { drop: 'Not sent: see the card above the prompt.' }
   })
 
+  // Tab on a held message puts the suggestion in the box; Enter then sends it unchecked.
+  on('prompt.edit', async ($, e, next) => {
+    if (!isTab(e.key) && e.inputText !== '\t') return next(e)
+    const fb = await read($, feedback)
+    if (fb?.kind !== 'checked' || !fb.isHeld || e.text.trim() !== fb.original.trim()) return next(e)
+    held = fb.better
+    return { text: fb.better, cursor: fb.better.length }
+  })
+
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const fb = await read($, feedback)
     if (e.props.hasSurvey || fb === null) return next(e)
@@ -490,11 +547,14 @@ export const register: Register = on => {
     const { Box, Button, Text } = $.ui.resolve(e)
     const hide = <Button key="hide" plain label="✕" onPress={() => update($, feedback, () => null)} />
 
-    const card = (color: string, title: string, ...body: RenderChildren[]) => (
+    const card = (color: string, title: string, hint: string, ...body: RenderChildren[]) => (
       <Box key="card" flexDirection="column" borderStyle="round" borderColor={color} paddingX={1}>
         <Box justifyContent="space-between">
-          <Text color={color} bold>
-            {title}
+          <Text>
+            <Text color={color} bold>
+              {title}
+            </Text>
+            <Text dimColor>{hint ? `   ${hint}` : ''}</Text>
           </Text>
           {hide}
         </Box>
@@ -509,12 +569,10 @@ export const register: Register = on => {
     if (fb.kind === 'translated') {
       return card(
         'cyan',
-        '中 → EN   Your English draft is in the box',
-        <Box marginTop={1}>
-          <Text>{fb.english}</Text>
-        </Box>,
+        '中 → EN',
+        'Your English draft is in the box: edit it, then Enter',
         fb.phrases.length > 0 && (
-          <Box key="phrases" flexDirection="column" marginTop={1}>
+          <Box key="phrases" flexDirection="column">
             {fb.phrases.map(p => (
               <Text>
                 <Text dimColor>• </Text>
@@ -525,31 +583,39 @@ export const register: Register = on => {
             ))}
           </Box>
         ),
-        <Box marginTop={1}>
-          <Text dimColor>Edit it, then press Enter to send.</Text>
-        </Box>,
       )
     }
 
     const upgrade = fb.upgrade !== '' && (
-      <Box key="upgrade" marginTop={fb.isNatural ? 1 : 0}>
-        <Text>
-          <Text color="magenta" bold>
-            ↑{' '}
-          </Text>
-          {fb.upgrade}
+      <Text key="upgrade">
+        <Text color="magenta" bold>
+          ↑{' '}
         </Text>
-      </Box>
+        {fb.upgrade}
+      </Text>
     )
 
+    // All good: one line, no border.
     if (fb.isNatural) {
-      return card('green', '✓ Natural English', upgrade)
+      return (
+        <Box key="natural" justifyContent="space-between">
+          <Text>
+            <Text color="green" bold>
+              ✓ Natural English
+            </Text>
+            {upgrade ? <Text dimColor>{'   '}</Text> : ''}
+            {upgrade}
+          </Text>
+          {hide}
+        </Box>
+      )
     }
 
     return card(
       'yellow',
       '✎ Almost there',
-      <Box key="diff" marginTop={1}>
+      fb.isHeld ? 'Tab: use the suggestion · Enter: send yours as is' : '',
+      <Box key="diff">
         <Text>
           {diffWords(fb.original, fb.better).map(p =>
             p.kind === 'same' ? (
@@ -567,7 +633,7 @@ export const register: Register = on => {
         </Text>
       </Box>,
       fb.tips.length > 0 && (
-        <Box key="tips" flexDirection="column" marginTop={1}>
+        <Box key="tips" flexDirection="column">
           {fb.tips.map((tip, i) => (
             <Text>
               {i === 0 ? '💡 ' : '   '}
@@ -578,12 +644,6 @@ export const register: Register = on => {
         </Box>
       ),
       upgrade,
-      fb.isHeld && (
-        <Box key="actions" marginTop={1}>
-          <Button key="use" hotkey="u" variant="primary" label="Use suggestion" onPress={() => void $.prompt.fill({ text: fb.better })} />
-          <Text dimColor>   or fix it yourself · Enter on your own text sends it as is</Text>
-        </Box>
-      ),
     )
   })
 

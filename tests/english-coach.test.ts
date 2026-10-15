@@ -2,6 +2,8 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { ModelCompleteResult, On, PromptComposeInput, RenderElement } from 'claude-code'
 
+import { diffWords } from '../hooks/register'
+
 const USAGE = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 
 const COMPOSE: PromptComposeInput = {
@@ -33,6 +35,15 @@ const world = (on: On, store: Record<string, unknown> = {}) => {
   const clock = mock.clock(on)
   const filled: string[] = []
   const sent: string[] = []
+  const prompts: string[] = []
+  const drawn: string[] = []
+  on('session.messages', () => ({ value: [{ role: 'assistant', text: 'Shall I add a retry?', toolUses: [] }] }) as never)
+  on('turn.complete', ($, e) => ({ text: e.answer }))
+  on('ui.render', { component: 'AssistantMessage' }, ($, e) => {
+    drawn.push(e.props.text)
+    const { Box } = $.ui.resolve(e)
+    return h(Box, { key: 'reply' }) as RenderElement
+  })
   on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'base', scope: 'shared' as const }] }))
   on('prompt.submit', ($, e) => {
     sent.push(e.text)
@@ -48,6 +59,10 @@ const world = (on: On, store: Record<string, unknown> = {}) => {
     return { isFilled: true } as never
   })
   on('model.complete', ($, e) => {
+    prompts.push(e.prompt)
+    if (e.system?.includes('read an English reply')) {
+      return { value: { isAnswered: true, usage: USAGE as never, text: '{"glosses": [{"term": "idempotent", "zh": "幂等的"}]}' } }
+    }
     const value: ModelCompleteResult = {
       isAnswered: true,
       usage: USAGE as never,
@@ -59,7 +74,7 @@ const world = (on: On, store: Record<string, unknown> = {}) => {
     }
     return { value }
   })
-  return { clock, filled, sent }
+  return { clock, filled, sent, prompts, drawn }
 }
 
 const submit = ($: Engine, text: string) =>
@@ -69,8 +84,10 @@ test('adds the English-only section to the system prompt', async ($, on) => {
   world(on)
   const { sections } = await $.prompt.compose(COMPOSE)
   const mine = sections.find(s => s.id === 'english-coach:mode')
-  expect(mine?.text).toContain('English only')
+  expect(mine?.text).toContain('Write every reply in English')
   expect(mine?.text).toContain('B1')
+  // Glosses are drawn afterwards, so the prompt asks Claude for none.
+  expect(mine?.text).not.toContain('（')
 })
 
 test('leaves the system prompt alone when switched off', async ($, on) => {
@@ -219,4 +236,49 @@ test('/english demo shows a sample card', async ($, on) => {
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ text: /Almost there/ })).toBeDefined()
   expect(await ui.find({ key: 'use' })).toBeDefined()
+})
+
+const REPLY = 'Make the handler idempotent so a retry is safe.\n\n```js\nconst idempotent = true\n```'
+
+test('glosses are added to the drawn reply after the turn, outside code', async ($, on) => {
+  const w = world(on)
+  const ui = await $.ui.mount({
+    plugin: 'english-coach',
+    surface: 'terminal',
+    component: 'AssistantMessage',
+    props: { text: REPLY, isFirstOfReply: true },
+  })
+  expect(w.drawn.at(-1)).toBe(REPLY)
+  await $.turn.complete({ answer: REPLY, durationMs: 1, isAborted: false, turnId: 't1', reason: 'end_turn' } as never)
+  await w.clock.advance(400)
+  const glossed = 'Make the handler idempotent（幂等的） so a retry is safe.\n\n```js\nconst idempotent = true\n```'
+  expect(w.drawn.at(-1)).toBe(glossed)
+  await ui.unmount()
+})
+
+test('no glosses when they are switched off', async ($, on) => {
+  const w = world(on, { settings: { gloss: false } })
+  await $.ui.mount({ plugin: 'english-coach', surface: 'terminal', component: 'AssistantMessage', props: { text: REPLY, isFirstOfReply: true } })
+  await $.turn.complete({ answer: REPLY, durationMs: 1, isAborted: false, turnId: 't1', reason: 'end_turn' } as never)
+  await w.clock.advance(400)
+  expect(w.drawn.at(-1)).toBe(REPLY)
+})
+
+test('the check reads Claude\'s last reply as context', async ($, on) => {
+  const w = world(on)
+  await submit($, 'Yes please, can you add it')
+  expect(w.prompts.at(-1)).toContain('Shall I add a retry?')
+  expect(w.prompts.at(-1)).toContain('Yes please, can you add it')
+})
+
+test('a changed run is drawn whole: struck words, then their replacement', () => {
+  const pieces = diffWords(
+    'Okay, quite good job. The next thing is: how do you deal with the reply of Claude Code?',
+    'Good job, thanks. Next, how do you handle the reply from Claude Code?',
+  )
+  for (let k = 0; k + 1 < pieces.length; k++) {
+    expect(`${pieces[k]?.kind}>${pieces[k + 1]?.kind}`).not.toBe('add>del')
+    if (pieces[k]?.kind === 'del' && pieces[k + 1]?.kind === 'add') expect(pieces[k + 1]?.text.startsWith(' ')).toBe(true)
+  }
+  expect(pieces.filter(p => p.kind === 'same').map(p => p.text).join('')).toContain('how do you')
 })

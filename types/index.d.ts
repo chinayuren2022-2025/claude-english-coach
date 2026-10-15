@@ -27,8 +27,14 @@ export type LevelView = {
   goalLevel: string | null
 }
 
+// A Chinese gloss for a word or phrase in one of Claude's replies.
+export type Gloss = { term: string; zh: string }
+
+// The glosses of each reply block, by its requestId, for the text they were made from.
+export type ReplyGlosses = Record<string, { text: string; glosses: Gloss[] }>
+
 declare module 'claude-code' {
   interface PluginState {
-    'english-coach': { feedback: Feedback | null; level: LevelView | null }
+    'english-coach': { feedback: Feedback | null; level: LevelView | null; glosses: ReplyGlosses }
   }
 }

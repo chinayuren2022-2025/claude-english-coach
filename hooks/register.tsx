@@ -1,10 +1,16 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PromptOrigin, Register, RenderChildren } from 'claude-code'
 
-import type { Feedback, LevelView, Phrase } from '../types'
+import type { Feedback, Gloss, LevelView, Phrase, ReplyGlosses } from '../types'
 
 const feedback = atom({ plugin: 'english-coach', key: 'feedback' } as const, null)
 const levelView = atom({ plugin: 'english-coach', key: 'level' } as const, null)
+const replyGlosses = atom({ plugin: 'english-coach', key: 'glosses' } as const, {} as ReplyGlosses)
+
+// Glosses per reply: at most this many replies kept, this many new blocks glossed per turn.
+const GLOSSED_KEPT = 100
+const BLOCKS_PER_TURN = 6
+const GLOSSES_PER_BLOCK = 6
 
 const LEVELS = ['A2', 'B1', 'B2', 'C1'] as const
 type Level = (typeof LEVELS)[number]
@@ -115,7 +121,7 @@ type Piece = { text: string; kind: 'same' | 'del' | 'add' }
 const tokenize = (text: string) => text.match(/[\p{L}\p{N}'’-]+|[^\s\p{L}\p{N}]/gu) ?? []
 
 // Word diff of the person's text against the better one, by longest common subsequence.
-const diffWords = (from: string, to: string): Piece[] => {
+export const diffWords = (from: string, to: string): Piece[] => {
   const a = tokenize(from)
   const b = tokenize(to)
   const lcs: number[][] = Array.from({ length: a.length + 1 }, () => new Array<number>(b.length + 1).fill(0))
@@ -123,29 +129,35 @@ const diffWords = (from: string, to: string): Piece[] => {
     for (let j = b.length - 1; j >= 0; j--)
       lcs[i]![j] = a[i] === b[j] ? lcs[i + 1]![j + 1]! + 1 : Math.max(lcs[i + 1]![j]!, lcs[i]![j + 1]!)
 
-  const pieces: Piece[] = []
-  const push = (text: string, kind: Piece['kind']) => {
-    const last = pieces.at(-1)
-    const glued = /^[,.!?;:)\]}%’]/.test(text) || pieces.length === 0
-    const spaced = glued ? text : ` ${text}`
-    if (last?.kind === kind) last.text += spaced
-    else pieces.push({ text: spaced, kind })
-  }
+  const ops: { tok: string; kind: Piece['kind'] }[] = []
   let i = 0
   let j = 0
   while (i < a.length || j < b.length) {
-    if (i < a.length && j < b.length && a[i] === b[j]) push(a[i++]!, 'same'), j++
-    else if (j < b.length && (i === a.length || lcs[i]![j + 1]! >= lcs[i + 1]![j]!)) push(b[j++]!, 'add')
-    else push(a[i++]!, 'del')
+    if (i < a.length && j < b.length && a[i] === b[j]) ops.push({ tok: a[i++]!, kind: 'same' }), j++
+    else if (j < b.length && (i === a.length || lcs[i]![j + 1]! >= lcs[i + 1]![j]!)) ops.push({ tok: b[j++]!, kind: 'add' })
+    else ops.push({ tok: a[i++]!, kind: 'del' })
   }
-  // A deletion is drawn before the addition that replaces it.
-  for (let k = 0; k + 1 < pieces.length; k++) {
-    if (pieces[k]!.kind === 'add' && pieces[k + 1]!.kind === 'del') {
-      const [add, del] = [pieces[k]!, pieces[k + 1]!]
-      pieces[k] = del
-      pieces[k + 1] = add
-    }
+
+  // Each run of changes is drawn whole: what goes first, then what replaces it.
+  const ordered: typeof ops = []
+  let run: typeof ops = []
+  const flush = () => {
+    ordered.push(...run.filter(o => o.kind === 'del'), ...run.filter(o => o.kind === 'add'))
+    run = []
   }
+  for (const o of ops) {
+    if (o.kind === 'same') flush(), ordered.push(o)
+    else run.push(o)
+  }
+  flush()
+
+  const pieces: Piece[] = []
+  ordered.forEach(({ tok, kind }, k) => {
+    const text = k === 0 || /^[,.!?;:)\]}%’]/.test(tok) ? tok : ` ${tok}`
+    const last = pieces.at(-1)
+    if (last?.kind === kind) last.text += text
+    else pieces.push({ text, kind })
+  })
   return pieces
 }
 
@@ -185,16 +197,33 @@ const translate = async ($: EngineInterface, text: string, level: Level) => {
   return { english: json.english.trim(), phrases }
 }
 
+// The end of Claude's last reply: what the person's message answers.
+const lastReply = async ($: EngineInterface) => {
+  try {
+    const messages = await $.session.messages()
+    const reply = [...messages].reverse().find(m => m.role === 'assistant' && m.text.trim() !== '')
+    return reply?.text.slice(-1500) ?? ''
+  } catch {
+    return ''
+  }
+}
+
 const check = async ($: EngineInterface, text: string, s: Settings, level: Level, timeoutMs?: number) => {
+  const context = await lastReply($)
   const json = await ask(
     $,
-    `You coach a Chinese-speaking English learner, now around CEFR ${level}, whose goal is ${s.goal}. Judge the English of their message (ignore code, paths, commands). ` +
-      `If it is clear and natural enough, set "natural" true; ignore casing, a missing final period and other tiny slips. ` +
-      `Otherwise give the most natural version that keeps their meaning and words where possible, and up to 3 tips in Simplified Chinese, one per main mistake, each under 30 characters. ` +
+    `You coach a Chinese-speaking English learner, now around CEFR ${level}, whose goal is ${s.goal}. They are chatting with an AI assistant, Claude, ` +
+      `and you judge the English of the message they are about to send it (ignore code, paths, commands). In their message "you" is Claude and "I" is the learner. ` +
+      `You may be shown Claude's previous reply, only so you understand what they mean; never judge it. ` +
+      `"better" fixes real errors only: grammar, a wrong word, a collocation a native reader would stumble on. Make the smallest edit that fixes each one. ` +
+      `Never change the meaning, who does what (I, you, we), the question asked, names, facts or tone, and never paraphrase, merge or split a sentence that is already correct. ` +
+      `If there is no real error, set "natural" true, even if it could be more elegant: style ideas belong in "upgrade". Ignore casing, a missing final period and other tiny slips. ` +
+      `For each real error give a tip in Simplified Chinese, at most 3, each under 30 characters. ` +
       `Whether natural or not, offer one "upgrade": a more precise or higher-level word, collocation or structure that a ${s.goal} candidate would use for part of the message, written "plain → better" (empty if nothing fits). ` +
       `Also estimate the CEFR level (A1, A2, B1, B2, C1 or C2) this message shows. ` +
       `Reply with JSON only: {"natural": true|false, "better": "<improved message, or empty>", "tips": ["<中文提示>"], "upgrade": "<plain → better, or empty>", "cefr": "<level>"}`,
-    text,
+    (context ? `Claude's previous reply (context only):\n\"\"\"\n${context}\n\"\"\"\n\n` : '') +
+      `The learner's message to judge:\n\"\"\"\n${text}\n\"\"\"`,
     timeoutMs,
   )
   if (!json || typeof json.natural !== 'boolean') return null
@@ -209,20 +238,57 @@ const check = async ($: EngineInterface, text: string, s: Settings, level: Level
   }
 }
 
+// Kept light on purpose: glosses are added to the drawing afterwards, so Claude's
+// own writing carries no learner rules beyond the language it writes in.
 const systemSection = (s: Settings, level: Level) =>
   [
     `# English learning mode`,
-    `The person is a Chinese-speaking English learner, currently around CEFR ${level}, aiming for ${s.goal}. They are using this session to practise English with you.`,
-    `- Write every reply in English only, even when they write in Chinese. Code, commands, identifiers, file paths, quoted text and the glosses below are the only exceptions.`,
-    `- Pitch your English at ${level}: common words, short sentences, active voice, one idea per sentence. Keep technical content exact; simplify the language, not the substance.`,
-    `- To stretch them toward ${s.goal}, use a few useful words, collocations and linking phrases from one level above ${level} in each reply, where they fit naturally.`,
-    s.gloss
-      ? `- The first time a reply uses a word or phrase likely above ${level} (rare words, idioms, phrasal verbs, technical terms whose meaning is not obvious), put a short Simplified Chinese gloss in full-width parentheses right after it: "idempotent（幂等的）", "work around（绕过）". At most 5 per reply, never the same word twice in this conversation, and never inside code blocks, inline code, commands or paths.`
-      : '',
-    `- Do not correct their English in your replies unless they ask; a separate tool gives them feedback. Answer what they mean.`,
-  ]
-    .filter(Boolean)
-    .join('\n')
+    `The person is a Chinese-speaking English learner (around CEFR ${level}, aiming for ${s.goal}) practising English with you.`,
+    `- Write every reply in English, even when they write in Chinese. Code, commands and quoted text stay as they are.`,
+    `- Where it costs nothing in accuracy, prefer clear, plain wording.`,
+    `- A separate tool gives them feedback on their English and glosses hard words in your replies; do not correct their English or add translations unless they ask.`,
+  ].join('\n')
+
+const pickGlosses = async ($: EngineInterface, text: string, level: Level, s: Settings, known: string[]): Promise<Gloss[]> => {
+  const json = await ask(
+    $,
+    `You help a Chinese-speaking English learner, around CEFR ${level} and aiming for ${s.goal}, read an English reply. ` +
+      `Pick up to ${GLOSSES_PER_BLOCK} words or phrases in it that are likely above ${level} and worth learning: rare words, idioms, phrasal verbs, collocations, technical terms whose meaning is not obvious. ` +
+      `Copy each term exactly as it appears in the text, outside code. Skip code identifiers, file names, commands, product names` +
+      (known.length ? `, and these terms the learner has already seen glossed: ${known.join(', ')}` : '') +
+      `. Give each a short Simplified Chinese gloss of its meaning here, 2 to 8 characters. ` +
+      `Reply with JSON only: {"glosses": [{"term": "<exact text>", "zh": "<释义>"}]}`,
+    text.slice(0, 6000),
+  )
+  if (!json || !Array.isArray(json.glosses)) return []
+  return json.glosses
+    .filter((g: any) => typeof g?.term === 'string' && typeof g?.zh === 'string' && g.term.trim() && g.zh.trim())
+    .slice(0, GLOSSES_PER_BLOCK)
+    .map((g: any) => ({ term: g.term.trim(), zh: g.zh.trim() }))
+}
+
+const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+// Puts "term（释义）" after the first use of each term, outside code, links and URLs.
+const applyGlosses = (markdown: string, glosses: Gloss[]) => {
+  const parts = markdown.split(/(```[\s\S]*?```|`[^`\n]*`|\]\([^)]*\)|https?:\/\/\S+)/)
+  const done = new Set<string>()
+  return parts
+    .map((part, i) => {
+      if (i % 2 === 1) return part
+      let out = part
+      for (const g of glosses) {
+        const key = g.term.toLowerCase()
+        if (done.has(key)) continue
+        const re = new RegExp(`(?<![\\p{L}\\p{N}])(${escapeRegExp(g.term)})(?![\\p{L}\\p{N}（])`, 'iu')
+        if (!re.test(out)) continue
+        done.add(key)
+        out = out.replace(re, `$1（${g.zh}）`)
+      }
+      return out
+    })
+    .join('')
+}
 
 const HELP = async ($: EngineInterface, s: Settings) =>
   [
@@ -277,10 +343,31 @@ const applyArgs = (s: Settings, args: string): Settings | string => {
   return `Unknown option "${trimmed}".`
 }
 
+// Reply blocks drawn, newest last, with their latest text; and terms already glossed.
+const seen = new Map<string, string>()
+const glossedTerms = new Set<string>()
+
+const glossNewBlocks = async ($: EngineInterface) => {
+  const s = await loadSettings($)
+  if (!s.isOn || !s.gloss) return
+  const level = await currentLevel($, s)
+  const made = await read($, replyGlosses)
+  const todo = [...seen].filter(([id, text]) => made[id]?.text !== text && text.trim().length >= 40).slice(-BLOCKS_PER_TURN)
+  for (const [id, text] of todo) {
+    const glosses = await pickGlosses($, text, level, s, [...glossedTerms].slice(-100))
+    glosses.forEach(g => glossedTerms.add(g.term.toLowerCase()))
+    await update($, replyGlosses, all => {
+      const next = { ...all, [id]: { text, glosses } }
+      const ids = Object.keys(next)
+      for (const old of ids.slice(0, Math.max(0, ids.length - GLOSSED_KEPT))) delete next[old]
+      return next
+    })
+  }
+}
+
 export const register: Register = on => {
   // The message last held for fixing: Enter on it again sends it as is.
   let held: string | null = null
-
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'english',
@@ -498,6 +585,26 @@ export const register: Register = on => {
         </Box>
       ),
     )
+  })
+
+  // Glosses are made once the turn's reply is whole, off the dispatch.
+  on('turn.complete', async ($, e, next) => {
+    const done = await next(e)
+    if (e.agentId === undefined) $.clock.after(300, () => void glossNewBlocks($))
+    return done
+  })
+
+  // Draws a reply with its glosses; the stored reply, which Claude reads, is unchanged.
+  on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
+    if (e.props.isSummary) return next(e)
+    seen.delete(e.requestId)
+    seen.set(e.requestId, e.props.text)
+    if (seen.size > 200) seen.delete(seen.keys().next().value!)
+
+    const s = await loadSettings($)
+    const made = (await read($, replyGlosses))[e.requestId]
+    if (!s.isOn || !s.gloss || !made || made.text !== e.props.text || made.glosses.length === 0) return next(e)
+    return next({ ...e, props: { ...e.props, text: applyGlosses(e.props.text, made.glosses) } })
   })
 
   // The level slider, at the right of the footer under the prompt.

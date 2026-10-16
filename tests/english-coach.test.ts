@@ -387,3 +387,12 @@ test('only real, exactly quoted fixes are applied', () => {
   expect(r.fixes.map(f => f.tip)).toEqual(['三单'])
   expect(r.better).toBe('Please make the change after you read it, i think it work')
 })
+
+test('a missing apostrophe is a spelling fix, a curly one is not', () => {
+  // Haiku's own answer to a message that was let through as natural.
+  const r = applyFixes('Hi, just to test the plugin and you dont need to answer', [
+    { wrong: 'dont', right: "don't", type: 'spelling', tip: "否定缩写 don't 需要撇号" },
+  ])
+  expect(r.better).toBe("Hi, just to test the plugin and you don't need to answer")
+  expect(applyFixes("I don't know", [{ wrong: "don't", right: 'don’t', type: 'spelling', tip: '' }]).fixes).toEqual([])
+})

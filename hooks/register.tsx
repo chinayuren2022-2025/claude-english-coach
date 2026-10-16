@@ -219,7 +219,8 @@ const lastReply = async ($: EngineInterface) => {
 // Words that say who does what: a fix must not change them.
 const PERSONS = /\b(i|me|my|mine|you|your|yours|we|us|our|ours|he|him|his|she|her|they|them|their)\b/gi
 const persons = (t: string) => (t.match(PERSONS) ?? []).map(w => w.toLowerCase()).join(' ')
-const bare = (t: string) => t.toLowerCase().replace(/[\s.,!?;:'"’]/g, '')
+// What a fix must change beyond casing and punctuation; an apostrophe is spelling (dont → don't).
+const bare = (t: string) => t.toLowerCase().replace(/’/g, "'").replace(/[\s.,!?;:"]/g, '')
 
 export type Fix = { wrong: string; right: string; tip: string }
 

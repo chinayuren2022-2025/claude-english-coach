@@ -406,10 +406,11 @@ const hideLater = ($: EngineInterface, card: Feedback, ms: number) => {
 }
 
 // The key that swaps a held message between the fix and the person's own: the engine keeps
-// Tab and the arrows, so a mod sees only typed characters. Backtick, by Tab; a Chinese input
-// method types it as "·".
+// Tab and the arrows, so a mod sees only typed characters. Backtick, by Tab; Chinese input
+// methods type that key as "·", "、" or a full-width "｀".
 const SWAP_KEY = '`'
-const isSwap = (typed: string) => typed === SWAP_KEY || typed === '·'
+const SWAP_TYPED = new Set([SWAP_KEY, '·', '、', '｀'])
+const isSwap = (typed: string) => SWAP_TYPED.has(typed)
 
 export const register: Register = on => {
   // The text a held message has in the box: Enter on it sends it unchecked.

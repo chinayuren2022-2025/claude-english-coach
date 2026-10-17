@@ -206,11 +206,19 @@ test('backtick swaps the box between the fix and the person\'s own, and Enter se
   expect(w.prompts.length).toBe(checks)
 })
 
-test('the Chinese input method\'s · swaps too', async ($, on) => {
+test('what a Chinese input method types for that key swaps too: ·, 、 and ｀', async ($, on) => {
   world(on)
   on('prompt.edit', ($, e) => ({ text: e.text + e.inputText, cursor: e.cursor + e.inputText.length }))
   await submit($, MINE)
   expect((await type($, FIXED, '·')).text).toBe(MINE)
+  expect((await type($, MINE, '、')).text).toBe(FIXED)
+  expect((await type($, FIXED, '｀')).text).toBe(MINE)
+})
+
+test('、 types as usual in Chinese text, with nothing held', async ($, on) => {
+  world(on)
+  on('prompt.edit', ($, e) => ({ text: e.text + e.inputText, cursor: e.cursor + e.inputText.length }))
+  expect((await type($, '函数', '、')).text).toBe('函数、')
 })
 
 test('backtick types as usual in an edited box, or with nothing held', async ($, on) => {

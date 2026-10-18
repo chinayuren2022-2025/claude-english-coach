@@ -2,7 +2,14 @@ export type Phrase = { zh: string; en: string }
 
 export type Feedback =
   | { kind: 'pending'; original: string }
-  | { kind: 'translated'; original: string; english: string; phrases: Phrase[] }
+  | {
+      kind: 'translated'
+      original: string
+      english: string
+      phrases: Phrase[]
+      // While a draft waits in the box, which version it has: the English (the first) or the person's Chinese.
+      inBox?: 'english' | 'chinese'
+    }
   | {
       kind: 'checked'
       original: string
@@ -13,7 +20,7 @@ export type Feedback =
       upgrade: string
       // True while the message waits in the box for the person to send it.
       isHeld: boolean
-      // Which version a held message has in the box: the fix (the default) or the person's own.
+      // Which version a held message has in the box: the fix (the first) or the person's own.
       inBox?: 'better' | 'original'
     }
 

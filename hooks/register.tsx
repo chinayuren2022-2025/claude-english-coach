@@ -109,16 +109,30 @@ const isPerson = (origin: PromptOrigin) =>
 // Placeholders the box puts in for pasted images and long pastes.
 const PLACEHOLDERS = /\[(?:Image|Pasted text) #\d+[^\]]*\]/g
 
-// Code, inline code, URLs, paths and placeholders are not the person's prose.
-const prose = (text: string) =>
-  text
-    .replace(/```[\s\S]*?```/g, ' ')
-    .replace(/`[^`]*`/g, ' ')
-    .replace(PLACEHOLDERS, ' ')
-    .replace(/https?:\/\/\S+/g, ' ')
-    .replace(/\S*[\/\\]\S*/g, ' ')
+// File references, whose Chinese must stay as it is: an @-mention (quoted when it holds spaces),
+// a quoted path, a path with spaces in it up to its file name, a bare file name.
+const FILE_REFS = [
+  /@"[^"\n]*"|@\S+/g,
+  /(["“'‘「])[^"”'’」\n]*[\/\\][^"”'’」\n]*["”'’」]/g,
+  /(?<![\p{L}\p{N}])(?:~|\.{1,2}|[A-Za-z]:)?[\/\\][^\n]*?\.[A-Za-z0-9]{1,8}(?![\p{L}\p{N}])/gu,
+  /[^\s"“”'‘’「」()（）<>]+\.[A-Za-z0-9]{1,8}(?![\p{L}\p{N}])/gu,
+]
 
-const hasChinese = (text: string) => /[㐀-鿿]/.test(prose(text))
+// Code, inline code, URLs, file references, paths and placeholders are not the person's prose.
+const prose = (text: string) =>
+  FILE_REFS.reduce(
+    (t, re) => t.replace(re, ' '),
+    text
+      .replace(/```[\s\S]*?```/g, ' ')
+      .replace(/`[^`]*`/g, ' ')
+      .replace(PLACEHOLDERS, ' ')
+      .replace(/https?:\/\/\S+/g, ' '),
+  ).replace(/\S*[\/\\]\S*/g, ' ')
+
+// Quoted text is kept as it is, so Chinese in quotes alone does not make a message Chinese.
+const QUOTED = /"[^"\n]*"|“[^”\n]*”|「[^」\n]*」|『[^』\n]*』/g
+
+const hasChinese = (text: string) => /[㐀-鿿]/.test(prose(text).replace(QUOTED, ' '))
 
 const wordCount = (text: string) => (prose(text).match(/[A-Za-z]+(?:'[a-z]+)?/g) ?? []).length
 
@@ -412,8 +426,53 @@ const SWAP_KEY = '`'
 const SWAP_TYPED = new Set([SWAP_KEY, '·', '、', '｀'])
 const isSwap = (typed: string) => SWAP_TYPED.has(typed)
 
+// A message waiting in the box, a held fix or an English draft: the version in the box now,
+// the one a swap puts there, and the card once swapped.
+type Waiting = { now: string; other: string; swapped: Feedback }
+
+const waiting = (fb: Feedback | null): Waiting | null => {
+  if (fb?.kind === 'checked' && fb.isHeld) {
+    const isFix = fb.inBox === 'better'
+    return { now: isFix ? fb.better : fb.original, other: isFix ? fb.original : fb.better, swapped: { ...fb, inBox: isFix ? 'original' : 'better' } }
+  }
+  if (fb?.kind === 'translated' && fb.inBox) {
+    const isEnglish = fb.inBox === 'english'
+    return { now: isEnglish ? fb.english : fb.original, other: isEnglish ? fb.original : fb.english, swapped: { ...fb, inBox: isEnglish ? 'chinese' : 'english' } }
+  }
+  return null
+}
+
+// The card once its message is sent: nothing waits on it any more.
+const settled = (fb: Feedback): Feedback =>
+  fb.kind === 'checked'
+    ? { ...fb, isHeld: false }
+    : fb.kind === 'translated'
+      ? { kind: 'translated', original: fb.original, english: fb.english, phrases: fb.phrases }
+      : fb
+
+// Turns the card of a waiting message to its other version; returns that version's text for the box.
+const swapCard = async ($: EngineInterface, w: Waiting) => {
+  await update($, feedback, shown => waiting(shown)?.swapped ?? shown)
+  return w.other
+}
+
+// The card's button: the other version into the box, whatever the box has now. Returns it, or null.
+const swapBox = async ($: EngineInterface) => {
+  const w = waiting(await read($, feedback))
+  if (w === null) return null
+  const text = await swapCard($, w)
+  await $.prompt.fill({ text })
+  return text
+}
+
+// An English draft into the box, its card waiting on it until something is sent.
+const showDraft = async ($: EngineInterface, original: string, t: { english: string; phrases: Phrase[] }) => {
+  await update($, feedback, (): Feedback => ({ kind: 'translated', original, ...t, inBox: 'english' }))
+  $.clock.after(50, () => void $.prompt.fill({ text: t.english }))
+}
+
 export const register: Register = on => {
-  // The text a held message has in the box: Enter on it sends it unchecked.
+  // The text a waiting message has in the box: Enter on it sends it as it is.
   let held: string | null = null
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -452,10 +511,8 @@ export const register: Register = on => {
     const s = await loadSettings($)
     const t = await translate($, text, await currentLevel($, s))
     if (!t) return { text: 'Could not make an English draft just now. Try again.' }
-    const card: Feedback = { kind: 'translated', original: text, ...t }
-    await update($, feedback, () => card)
-    hideLater($, card, HIDE_DRAFT_MS)
-    $.clock.after(50, () => void $.prompt.fill({ text: t.english }))
+    held = t.english
+    await showDraft($, text, t)
     return { text: 'English draft is in the prompt box: edit it, then press Enter.' }
   })
 
@@ -472,6 +529,18 @@ export const register: Register = on => {
     const s = await loadSettings($)
     if (!s.isOn) return next(e)
 
+    // Anything sent settles a message waiting in the box; Enter on it as it was put there sends it
+    // as it is: a fix, the person's own, an English draft or their Chinese.
+    const shown = await read($, feedback)
+    if (shown !== null && waiting(shown) !== null) {
+      const card = settled(shown)
+      await update($, feedback, () => card)
+      hideLater($, card, HIDE_CHECKED_MS)
+    }
+    const wasHeld = held
+    held = null
+    if (wasHeld !== null && e.text.trim() === wasHeld.trim()) return next(e)
+
     if (e.text.startsWith(RAW_PREFIX)) return next({ ...e, text: e.text.slice(RAW_PREFIX.length).trimStart() })
 
     const level = await currentLevel($, s)
@@ -482,12 +551,15 @@ export const register: Register = on => {
         $.ui.toast('English coach: translation failed, sent as typed.')
         return next(e)
       }
-      const card: Feedback = { kind: 'translated', original: e.text, ...t }
-      await update($, feedback, () => card)
-      hideLater($, card, HIDE_DRAFT_MS)
-      if (s.chinese === 'auto') return next({ ...e, text: t.english })
-      $.clock.after(50, () => void $.prompt.fill({ text: t.english }))
-      return { drop: `Not sent: your English draft is in the box. (Start with "${RAW_PREFIX}" to send Chinese as typed.)` }
+      if (s.chinese === 'auto') {
+        const card: Feedback = { kind: 'translated', original: e.text, ...t }
+        await update($, feedback, () => card)
+        hideLater($, card, HIDE_DRAFT_MS)
+        return next({ ...e, text: t.english })
+      }
+      held = t.english
+      await showDraft($, e.text, t)
+      return { drop: `Not sent: your English draft is in the box. Enter sends it; ${SWAP_KEY} or ↩ 中文 on the card brings your Chinese back.` }
     }
 
     if (s.checkWhen === 'off' || !isCheckable(e.text)) return next(e)
@@ -522,18 +594,6 @@ export const register: Register = on => {
       return next(e)
     }
 
-    // Before sending: Enter on a held message, the fix or the person's own, sends it unchecked.
-    if (held !== null && original.trim() === held.trim()) {
-      held = null
-      const shown = await read($, feedback)
-      if (shown?.kind === 'checked' && shown.isHeld) {
-        const card: Feedback = { ...shown, isHeld: false }
-        await update($, feedback, () => card)
-        hideLater($, card, HIDE_CHECKED_MS)
-      }
-      return next(e)
-    }
-
     await update($, feedback, (): Feedback => ({ kind: 'pending', original }))
     const r = await check($, original, s, level, HOLD_TIMEOUT_MS)
     const isHeld = r !== null && !r.isNatural && r.better !== '' && r.better.trim() !== original.trim()
@@ -544,20 +604,18 @@ export const register: Register = on => {
     const fixed = r.better
     held = fixed
     $.clock.after(50, () => void $.prompt.fill({ text: fixed }))
-    return { drop: `Not sent yet: the corrected message is in the box. Enter sends it; ${SWAP_KEY} brings yours back.` }
+    return { drop: `Not sent yet: the corrected message is in the box. Enter sends it; ${SWAP_KEY} or ↩ Mine on the card brings yours back.` }
   })
 
-  // The swap key on an untouched held message trades the fix and the person's own; Enter sends either unchecked.
+  // The swap key on an untouched waiting message trades its versions; Enter sends either as it is.
+  // In the person's Chinese, · and 、 are punctuation they may be typing: there only the button swaps.
   on('prompt.edit', async ($, e, next) => {
     if (!isSwap(e.inputText) || e.start !== e.end) return next(e)
     const fb = await read($, feedback)
-    if (fb?.kind !== 'checked' || !fb.isHeld) return next(e)
-    const box = e.text.trim()
-    const inBox = box === fb.better.trim() ? 'original' : box === fb.original.trim() ? 'better' : null
-    if (inBox === null) return next(e)
-    const text = inBox === 'better' ? fb.better : fb.original
+    const w = waiting(fb)
+    if (w === null || e.text.trim() !== w.now.trim() || (fb?.kind === 'translated' && fb.inBox === 'chinese')) return next(e)
+    const text = await swapCard($, w)
     held = text
-    await update($, feedback, (shown): Feedback | null => (shown?.kind === 'checked' && shown.isHeld ? { ...shown, inBox } : shown))
     return { text, cursor: text.length }
   })
 
@@ -568,7 +626,8 @@ export const register: Register = on => {
     const { Box, Button, Text } = $.ui.resolve(e)
     const hide = <Button key="hide" plain label="✕" onPress={() => update($, feedback, () => null)} />
 
-    const card = (color: string, title: string, hint: string, ...body: RenderChildren[]) => (
+    // A click swaps too: some input methods type the swap key as punctuation the person wants.
+    const card = (color: string, title: string, hint: string, swapLabel: string, ...body: RenderChildren[]) => (
       <Box key="card" flexDirection="column" borderStyle="round" borderColor={color} paddingX={1}>
         <Box justifyContent="space-between">
           <Text>
@@ -577,7 +636,19 @@ export const register: Register = on => {
             </Text>
             <Text dimColor>{hint ? `   ${hint}` : ''}</Text>
           </Text>
-          {hide}
+          <Box gap={1}>
+            {swapLabel ? (
+              <Button
+                key="swap"
+                label={swapLabel}
+                onPress={async () => {
+                  const text = await swapBox($)
+                  if (text !== null) held = text
+                }}
+              />
+            ) : null}
+            {hide}
+          </Box>
         </Box>
         {body.filter(Boolean)}
       </Box>
@@ -591,7 +662,12 @@ export const register: Register = on => {
       return card(
         'cyan',
         '中 → EN',
-        'Your English draft is in the box: edit it, then Enter',
+        fb.inBox === 'english'
+          ? `Your English draft is in the box: edit it, then Enter · ${SWAP_KEY} back to your Chinese`
+          : fb.inBox === 'chinese'
+            ? 'Your Chinese is back: Enter sends it as typed, or edit it for a new draft'
+            : 'Sent in English',
+        fb.inBox === 'english' ? '↩ 中文' : fb.inBox === 'chinese' ? '→ English' : '',
         fb.phrases.length > 0 && (
           <Box key="phrases" flexDirection="column">
             {fb.phrases.map(p => (
@@ -636,6 +712,7 @@ export const register: Register = on => {
       'yellow',
       fb.isHeld && fb.inBox === 'better' ? '✎ Fixed in the box' : '✎ Almost there',
       !fb.isHeld ? '' : fb.inBox === 'better' ? `Enter send it · ${SWAP_KEY} back to yours` : `${SWAP_KEY} use the fix · Enter send yours as is`,
+      !fb.isHeld ? '' : fb.inBox === 'better' ? '↩ Mine' : '✎ The fix',
       <Box key="diff">
         <Text>
           {diffWords(fb.original, fb.better).map(p =>

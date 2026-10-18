@@ -132,8 +132,67 @@ test('Chinese input becomes an English draft in the box, with key phrases above 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...BAND, surface })
     expect(await ui.find({ text: /修复 → fix/ })).toBeDefined()
+    expect(await ui.find({ text: /back to your Chinese/ })).toBeDefined()
     await ui.unmount()
   }
+  // The card waits with the draft: its button is there until something is sent.
+  await w.clock.advance(30_000)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ text: /修复 → fix/ })).toBeDefined()
+})
+
+const ZH = '帮我修复这个bug'
+const DRAFT = 'Please help me fix this bug.'
+
+test('the card\'s button swaps an English draft and the Chinese, on every surface', async ($, on) => {
+  const w = world(on)
+  await submit($, ZH)
+  await w.clock.advance(100)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...BAND, surface })
+    await ui.press({ key: 'swap' })
+    expect(w.filled.at(-1)).toBe(ZH)
+    expect(await ui.find({ text: /Your Chinese is back/ })).toBeDefined()
+    await ui.press({ key: 'swap' })
+    expect(w.filled.at(-1)).toBe(DRAFT)
+    expect(await ui.find({ text: /back to your Chinese/ })).toBeDefined()
+    await ui.unmount()
+  }
+})
+
+test('Enter on the Chinese brought back sends it as typed; edited, it becomes a new draft', async ($, on) => {
+  const w = world(on)
+  await submit($, ZH)
+  await $.ui.mount({ ...BAND, surface: 'terminal' }).then(ui => ui.press({ key: 'swap' }))
+  const r = await submit($, ZH)
+  expect(r.drop).toBeUndefined()
+  expect(w.sent).toEqual([ZH])
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ text: /Your Chinese is back|back to your Chinese/ })).toBeUndefined()
+
+  await submit($, ZH)
+  await ui.press({ key: 'swap' })
+  const edited = await submit($, `${ZH}，谢谢`)
+  expect(edited.drop).toContain('English draft')
+  expect(w.sent).toEqual([ZH])
+})
+
+test('an untouched English draft is sent without a check', async ($, on) => {
+  const w = world(on)
+  await submit($, ZH)
+  const asked = w.prompts.length
+  await submit($, DRAFT)
+  expect(w.sent).toEqual([DRAFT])
+  expect(w.prompts.length).toBe(asked)
+})
+
+test('the swap key takes an English draft back to the Chinese; in the Chinese it types as usual', async ($, on) => {
+  world(on)
+  on('prompt.edit', ($, e) => ({ text: e.text + e.inputText, cursor: e.cursor + e.inputText.length }))
+  await submit($, ZH)
+  expect((await type($, DRAFT, '·')).text).toBe(ZH)
+  expect((await type($, ZH, '、')).text).toBe(`${ZH}、`)
+  expect((await type($, ZH, '`')).text).toBe(`${ZH}\``)
 })
 
 test('auto mode sends the translation at once', async ($, on) => {
@@ -146,6 +205,31 @@ test('the zh: prefix sends Chinese as typed', async ($, on) => {
   const w = world(on)
   await submit($, 'zh: 这段报错是什么意思')
   expect(w.sent).toEqual(['这段报错是什么意思'])
+})
+
+test('Chinese in file references and quotes does not make a message Chinese', async ($, on) => {
+  const w = world(on, { settings: { checkWhen: 'off' } })
+  const messages = [
+    'Please summarize @笔记.md for me',
+    'Read @"Academic/02 扭摆 实验/report.pdf" and list the results',
+    'Open /Users/me/Academic/02 扭摆 实验/report.pdf and check the units',
+    'Rename 扭摆实验报告.pdf to report.pdf',
+    'Look at C:\\Users\\me\\文档\\plan.docx please',
+    'Change the button text to “用户登录” on the login page',
+  ]
+  for (const text of messages) {
+    const r = await submit($, text)
+    expect(r.drop).toBeUndefined()
+  }
+  expect(w.sent).toEqual(messages)
+  expect(w.filled).toEqual([])
+})
+
+test('Chinese prose beside a file reference still becomes a draft', async ($, on) => {
+  const w = world(on)
+  const r = await submit($, 'Read 扭摆实验报告.pdf 然后帮我总结一下')
+  expect(r.drop).toContain('English draft')
+  expect(w.sent).toEqual([])
 })
 
 test('Chinese inside code does not trigger translation', async ($, on) => {
@@ -200,6 +284,23 @@ test('backtick swaps the box between the fix and the person\'s own, and Enter se
   expect(await ui.find({ text: /` use the fix · Enter send yours as is/ })).toBeDefined()
   expect((await type($, MINE)).text).toBe(FIXED)
   expect((await type($, FIXED)).text).toBe(MINE)
+  const checks = w.prompts.length
+  await submit($, MINE)
+  expect(w.sent).toEqual([MINE])
+  expect(w.prompts.length).toBe(checks)
+})
+
+test('the card\'s button swaps a held fix too, and Enter sends the one in the box as it is', async ($, on) => {
+  const w = world(on)
+  await submit($, MINE)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await ui.press({ key: 'swap' })
+  expect(w.filled.at(-1)).toBe(MINE)
+  expect(await ui.find({ text: /Almost there/ })).toBeDefined()
+  await ui.press({ key: 'swap' })
+  expect(w.filled.at(-1)).toBe(FIXED)
+  expect(await ui.find({ text: /Fixed in the box/ })).toBeDefined()
+  await ui.press({ key: 'swap' })
   const checks = w.prompts.length
   await submit($, MINE)
   expect(w.sent).toEqual([MINE])

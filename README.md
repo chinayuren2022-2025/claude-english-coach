@@ -12,8 +12,9 @@ Practise English by working with Claude in English only. Made for Chinese-speaki
 - **Out of your way.** A "natural" result is one line, and cards hide by themselves once nothing waits on them (8 seconds; 20 for a Chinese message translated and sent in auto mode). A held message or an English draft keeps its card until you send.
 - **Level up.** Even when your English is natural, you get one stronger word or phrase toward your goal: `fix this bug → track down this bug`.
 - **Write in Chinese when you're stuck.** Chinese or mixed input becomes an English draft in the box for you to check, with the key phrases shown: `优化 → optimize`. Click **↩ 中文** on the card (or type **`**) to get your Chinese back, and Enter sends it as typed; **→ English** brings the draft back. Chinese in file references (`@笔记.md`, paths, file names) and in quotes doesn't count, so an English message about a Chinese-named file is checked as English. Start a prompt with `zh:` to send Chinese as typed.
+- **Read a long reply in Chinese.** `/zh` has Haiku translate Claude's last reply into Chinese and draws it under the English, paragraph by paragraph, so you can compare the two. Code stays as it is, and technical terms keep their English: `竞态条件（race condition）`. `/zh` again hides it; `/zh 2` translates the reply before. Only you see it: the Chinese is drawn on screen and never written to the conversation, so Claude's context doesn't grow and Claude keeps replying in English.
 
-The checks, drafts and glosses use a small, fast model (Haiku): one call per message you send, and one per reply block Claude writes (at most 6 per turn).
+The checks, drafts, glosses and translations use a small, fast model (Haiku): one call per message you send, one per reply block Claude writes (at most 6 per turn), and one per paragraph you translate with `/zh`.
 
 ## Install
 
@@ -47,6 +48,7 @@ In the desktop app, where `/plugin` does not run: click **+** next to the prompt
 | `/english chinese review\|auto\|off` | Chinese input: draft to check (default), translate and send, or send as typed |
 | `/english demo` | Show a sample feedback card |
 | `/en <text>` | Turn Chinese or rough English into an English draft in the box |
+| `/zh` / `/zh 2` | Chinese translation of Claude's last reply (or the one before), drawn under it for you alone; again hides it |
 
 Settings are kept across sessions.
 

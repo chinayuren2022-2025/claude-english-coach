@@ -1,11 +1,12 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, PromptOrigin, Register, RenderChildren } from 'claude-code'
+import type { EngineInterface, PromptOrigin, Register, RenderChildren, SessionMessage } from 'claude-code'
 
-import type { Feedback, Gloss, LevelView, Phrase, ReplyGlosses } from '../types'
+import type { Feedback, Gloss, LevelView, Phrase, ReplyGlosses, ReplyTranslation } from '../types'
 
 const feedback = atom({ plugin: 'english-coach', key: 'feedback' } as const, null)
 const levelView = atom({ plugin: 'english-coach', key: 'level' } as const, null)
 const replyGlosses = atom({ plugin: 'english-coach', key: 'glosses' } as const, {} as ReplyGlosses)
+const translations = atom({ plugin: 'english-coach', key: 'translations' } as const, [] as ReplyTranslation[])
 
 // Glosses per reply: at most this many replies kept, this many new blocks glossed per turn.
 const GLOSSED_KEPT = 100
@@ -338,6 +339,114 @@ const applyGlosses = (markdown: string, glosses: Gloss[]) => {
     .join('')
 }
 
+// /zh keeps at most this many replies translated, and translates this many paragraphs at once.
+const ZH_KEPT = 20
+const ZH_AT_ONCE = 4
+
+const FENCE = /^\s*(```|~~~)/
+
+// A reply's paragraphs: blank lines part them, and a code block, blank lines and all, is one.
+export const paragraphs = (text: string) => {
+  const out: string[] = []
+  let lines: string[] = []
+  let isInCode = false
+  const end = () => {
+    const p = lines.join('\n').trim()
+    if (p) out.push(p)
+    lines = []
+  }
+  for (const line of text.split('\n')) {
+    if (FENCE.test(line)) {
+      if (!isInCode) end()
+      lines.push(line)
+      isInCode = !isInCode
+      if (!isInCode) end()
+    } else if (!isInCode && line.trim() === '') end()
+    else lines.push(line)
+  }
+  end()
+  return out
+}
+
+const isCode = (para: string) => FENCE.test(para)
+
+// Claude's replies, oldest first: what it wrote after each of the person's prompts, tool output left out.
+export const repliesOf = (messages: readonly SessionMessage[]) => {
+  const out: string[] = []
+  let texts: string[] = []
+  const end = () => {
+    if (texts.length) out.push(texts.join('\n\n'))
+    texts = []
+  }
+  for (const m of messages) {
+    if (m.role === 'user' && !m.toolResults?.length) end()
+    else if (m.role === 'assistant' && m.text.trim()) texts.push(m.text)
+  }
+  end()
+  return out
+}
+
+const sameReply = (t: ReplyTranslation, paras: string[]) => t.paras.length === paras.length && t.paras.every((p, i) => p === paras[i])
+
+const translatePara = async ($: EngineInterface, para: string, before: string) => {
+  const r = await $.model.complete({
+    model: 'haiku',
+    system:
+      `You translate a paragraph of a reply that Claude, an AI coding assistant, wrote to a Chinese-speaking developer, into natural Simplified Chinese. ` +
+      `Translate all of it faithfully: never summarize, add or leave out anything. ` +
+      `Keep markdown (lists, bold, headings, tables), inline code, file paths, commands, identifiers and URLs exactly as they are. ` +
+      `Give a technical term as its usual Chinese term with the English in full-width brackets the first time it appears, e.g. 竞态条件（race condition）; keep product names in English. ` +
+      `Reply with the translation only.`,
+    prompt: (before ? `The paragraph before it, for context only:\n"""\n${before}\n"""\n\n` : '') + `Translate this paragraph:\n"""\n${para}\n"""`,
+    effort: 'low',
+    maxTokens: 2000,
+    timeoutMs: 30_000,
+  })
+  if (!r.isAnswered) return null
+  return r.text.trim().replace(/^"""\s*|\s*"""$/g, '').trim() || null
+}
+
+// Paragraphs Haiku is translating now, so a second /zh does not ask for them again.
+const translating = new Set<string>()
+
+// Translates the paragraphs of a reply that have no Chinese yet, a few at a time, top first.
+const translateMissing = async ($: EngineInterface, paras: string[]) => {
+  const entry = (await read($, translations)).find(t => sameReply(t, paras))
+  if (!entry) return
+  const todo = entry.zh.flatMap((zh, i) => (zh === null && !translating.has(paras[i]!) ? [i] : []))
+  todo.forEach(i => translating.add(paras[i]!))
+  let k = 0
+  const work = async () => {
+    while (k < todo.length) {
+      const i = todo[k++]!
+      const zh = await translatePara($, paras[i]!, paras[i - 1] ?? '')
+      translating.delete(paras[i]!)
+      await update($, translations, list =>
+        list.map(t => (sameReply(t, paras) ? { ...t, zh: t.zh.map((was, j) => (j === i ? (zh ?? false) : was)) } : t)),
+      )
+    }
+  }
+  await Promise.all(Array.from({ length: ZH_AT_ONCE }, () => work()))
+}
+
+// The Chinese drawn under a reply block: its paragraphs' translations, from a reply /zh shows.
+const chineseFor = (list: readonly ReplyTranslation[], text: string): string | null => {
+  const paras = paragraphs(text)
+  if (paras.length === 0) return null
+  for (const t of [...list].reverse()) {
+    if (!t.isShown) continue
+    const at = paras.map(p => t.paras.indexOf(p))
+    if (at.some(i => i < 0)) continue
+    return at
+      .map(i => {
+        const zh = t.zh[i]
+        return zh === '' ? '〔代码见上〕' : zh === null ? '…' : zh === false ? '（这一段没翻译成功，再输入 /zh 重试）' : zh
+      })
+      .join('\n\n')
+  }
+  return null
+}
+
 const HELP = async ($: EngineInterface, s: Settings) =>
   [
     `English coach is ${s.isOn ? 'on' : 'off'} · level ${await levelLabel($, s)} · goal ${s.goal} · glosses ${s.gloss ? 'on' : 'off'} · Chinese input: ${s.chinese} · feedback ${s.checkWhen}`,
@@ -355,6 +464,7 @@ const HELP = async ($: EngineInterface, s: Settings) =>
     `/english feedback off          no feedback on your English`,
     `/english demo                  show a sample feedback card`,
     `/en <text>                     turn Chinese or rough English into an English draft in the box`,
+    `/zh                            Chinese translation of Claude's last reply, under it; again hides it (/zh 2: the reply before)`,
     `Start a prompt with "${RAW_PREFIX}" to send it as typed.`,
   ].join('\n')
 
@@ -485,6 +595,11 @@ export const register: Register = on => {
       description: 'Turn Chinese or rough English into an English draft in the prompt box',
       argumentHint: '<text>',
     })
+    await $.command.register({
+      name: 'zh',
+      description: "Chinese translation of Claude's last reply, drawn under it for you alone; again hides it",
+      argumentHint: '[2 for the reply before, 3, …]',
+    })
     // The level is drawn under the prompt now; clear the status line of earlier versions.
     $.ui.status(undefined)
     await publishLevel($, await loadSettings($))
@@ -514,6 +629,34 @@ export const register: Register = on => {
     held = t.english
     await showDraft($, text, t)
     return { text: 'English draft is in the prompt box: edit it, then press Enter.' }
+  })
+
+  // The translation is drawn under the reply, never printed as the command's output, which can go into what Claude reads.
+  on('command.run', { command: 'zh' }, async ($, e) => {
+    const arg = e.args.trim()
+    const back = arg === '' ? 1 : Number(arg)
+    if (!Number.isInteger(back) || back < 1) return { text: 'Usage: /zh, or /zh 2 for the reply before the last.' }
+    const reply = repliesOf(await $.session.messages()).at(-back)
+    if (reply === undefined) return { text: 'No reply from Claude to translate yet.' }
+
+    const paras = paragraphs(reply)
+    const list = await read($, translations)
+    const found = list.find(t => sameReply(t, paras))
+    if (found?.isShown && !found.zh.includes(false)) {
+      await update($, translations, all => all.map(t => (sameReply(t, paras) ? { ...t, isShown: false } : t)))
+      return {}
+    }
+    // Paragraphs translated before, in this reply or another, are not asked for again; failed ones are.
+    const known = new Map<string, string>()
+    for (const t of list)
+      t.paras.forEach((p, i) => {
+        const zh = t.zh[i]
+        if (typeof zh === 'string' && zh !== '') known.set(p, zh)
+      })
+    const entry: ReplyTranslation = { paras, zh: paras.map(p => (isCode(p) ? '' : (known.get(p) ?? null))), isShown: true }
+    await update($, translations, all => [...all.filter(t => !sameReply(t, paras)), entry].slice(-ZH_KEPT))
+    $.clock.after(0, () => void translateMissing($, paras))
+    return {}
   })
 
   on('prompt.compose', async ($, e, next) => {
@@ -752,7 +895,7 @@ export const register: Register = on => {
     return done
   })
 
-  // Draws a reply with its glosses; the stored reply, which Claude reads, is unchanged.
+  // Draws a reply with its glosses and, after /zh, its Chinese under it; the stored reply, which Claude reads, is unchanged.
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
     if (e.props.isSummary) return next(e)
     seen.delete(e.requestId)
@@ -761,8 +904,21 @@ export const register: Register = on => {
 
     const s = await loadSettings($)
     const made = (await read($, replyGlosses))[e.requestId]
-    if (!s.isOn || !s.gloss || !made || made.text !== e.props.text || made.glosses.length === 0) return next(e)
-    return next({ ...e, props: { ...e.props, text: applyGlosses(e.props.text, made.glosses) } })
+    const isGlossed = s.isOn && s.gloss && made?.text === e.props.text && made.glosses.length > 0
+    const reply = isGlossed && made ? { ...e, props: { ...e.props, text: applyGlosses(e.props.text, made.glosses) } } : e
+
+    const zh = chineseFor(await read($, translations), e.props.text)
+    if (zh === null) return next(reply)
+    const { Box, Markdown, Text } = $.ui.resolve(e)
+    return (
+      <Box key="with-zh" flexDirection="column">
+        {await next(reply)}
+        <Box key="zh" flexDirection="column" paddingLeft={2}>
+          <Text dimColor>── 中文 · /zh hides it ──</Text>
+          <Markdown key="zh-text" text={zh} dimColor />
+        </Box>
+      </Box>
+    )
   })
 
   // The level slider, at the right of the footer under the prompt.

@@ -2,7 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { ModelCompleteResult, On, PromptComposeInput, PromptEditInput, RenderElement } from 'claude-code'
 
-import { applyFixes, diffWords } from '../hooks/register'
+import { applyFixes, diffWords, paragraphs, repliesOf } from '../hooks/register'
 
 const USAGE = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 
@@ -30,14 +30,14 @@ const BAND = {
 
 const SLIDER = { plugin: 'english-coach', component: 'SessionMode', props: { modes: [] } } as const
 
-const world = (on: On, store: Record<string, unknown> = {}) => {
+const world = (on: On, store: Record<string, unknown> = {}, messages: unknown[] = [{ role: 'assistant', text: 'Shall I add a retry?', toolUses: [] }]) => {
   mock.store(on, store)
   const clock = mock.clock(on)
   const filled: string[] = []
   const sent: string[] = []
   const prompts: string[] = []
   const drawn: string[] = []
-  on('session.messages', () => ({ value: [{ role: 'assistant', text: 'Shall I add a retry?', toolUses: [] }] }) as never)
+  on('session.messages', () => ({ value: messages }) as never)
   on('turn.complete', ($, e) => ({ text: e.answer }))
   on('ui.render', { component: 'AssistantMessage' }, ($, e) => {
     drawn.push(e.props.text)
@@ -60,6 +60,11 @@ const world = (on: On, store: Record<string, unknown> = {}) => {
   })
   on('model.complete', ($, e) => {
     prompts.push(e.prompt)
+    if (e.system?.includes('into natural Simplified Chinese')) {
+      const para = e.prompt.split('Translate this paragraph:\n"""\n')[1]?.replace(/\n"""$/, '') ?? ''
+      if (para.includes('FAIL')) return { value: { isAnswered: false, reason: 'api-error', status: 500 } as never }
+      return { value: { isAnswered: true, usage: USAGE as never, text: `译：${para}` } }
+    }
     if (e.system?.includes('read an English reply')) {
       return { value: { isAnswered: true, usage: USAGE as never, text: '{"glosses": [{"term": "idempotent", "zh": "幂等的"}]}' } }
     }
@@ -463,6 +468,98 @@ test('no glosses when they are switched off', async ($, on) => {
   await $.turn.complete({ answer: REPLY, durationMs: 1, isAborted: false, turnId: 't1', reason: 'end_turn' } as never)
   await w.clock.advance(400)
   expect(w.drawn.at(-1)).toBe(REPLY)
+})
+
+const CODE = '```ts\nconst lock = new Mutex()\n\nawait lock.run(fill)\n```'
+const LAST = `There is a race condition in the cache.\n\nAdd a lock:\n\n${CODE}\n\nThen run the tests again.`
+const CONVO = [
+  { role: 'user', text: 'Why does the test fail?', toolUses: [] },
+  { role: 'assistant', text: 'The first reply.', toolUses: [] },
+  { role: 'user', text: 'And now?', toolUses: [] },
+  { role: 'assistant', text: 'Let me look.', toolUses: [] },
+  { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 't1', text: 'FAIL cache.test.ts', isError: false }] },
+  { role: 'assistant', text: LAST, toolUses: [] },
+]
+
+const zh = ($: Engine, args = '') => $.command.run({ command: 'zh', args, origin: { kind: 'composer' } } as never) as Promise<{ text?: string; context?: string[] }>
+
+const reply = (text: string) =>
+  ({ plugin: 'english-coach', surface: 'terminal', component: 'AssistantMessage', props: { text, isFirstOfReply: true } }) as const
+
+const chinese = async (ui: { find: (q: { key: string }) => Promise<{ text?: string } | undefined> }) => (await ui.find({ key: 'zh-text' }))?.text
+
+test('a reply\'s paragraphs: a code block with blank lines in it is one', () => {
+  expect(paragraphs(LAST)).toEqual(['There is a race condition in the cache.', 'Add a lock:', CODE, 'Then run the tests again.'])
+})
+
+test('Claude\'s replies are what it wrote after each prompt, tool output left out', () => {
+  expect(repliesOf(CONVO as never)).toEqual(['The first reply.', `Let me look.\n\n${LAST}`])
+})
+
+test('/zh draws the last reply in Chinese under it, paragraph by paragraph, code kept, and prints nothing', async ($, on) => {
+  const w = world(on, {}, CONVO)
+  const ui = await $.ui.mount(reply(LAST))
+  expect(await chinese(ui)).toBeUndefined()
+  const r = await zh($)
+  // Nothing for the transcript, which Claude reads: the Chinese is only drawn.
+  expect(r.text).toBeUndefined()
+  expect(r.context).toBeUndefined()
+  await w.clock.settle()
+  expect(await chinese(ui)).toBe(
+    '译：There is a race condition in the cache.\n\n译：Add a lock:\n\n〔代码见上〕\n\n译：Then run the tests again.',
+  )
+  // The English Claude wrote is drawn as it was.
+  expect(w.drawn.at(-1)).toBe(LAST)
+  // The block before, in the same reply, gets its own paragraph.
+  const before = await $.ui.mount(reply('Let me look.'))
+  expect(await chinese(before)).toBe('译：Let me look.')
+  // Each paragraph is translated with the one before it as context.
+  expect(w.prompts.find(p => p.includes('Translate this paragraph:\n"""\nAdd a lock:'))).toContain('race condition in the cache')
+})
+
+test('/zh again hides the Chinese, and shows it once more without asking Haiku again', async ($, on) => {
+  const w = world(on, {}, CONVO)
+  const ui = await $.ui.mount(reply(LAST))
+  await zh($)
+  await w.clock.settle()
+  const asked = w.prompts.length
+  await zh($)
+  expect(await chinese(ui)).toBeUndefined()
+  await zh($)
+  await w.clock.settle()
+  expect(await chinese(ui)).toContain('译：Add a lock:')
+  expect(w.prompts.length).toBe(asked)
+})
+
+test('/zh 2 translates the reply before the last; the last stays in English', async ($, on) => {
+  const w = world(on, {}, CONVO)
+  const first = await $.ui.mount(reply('The first reply.'))
+  const last = await $.ui.mount(reply(LAST))
+  await zh($, '2')
+  await w.clock.settle()
+  expect(await chinese(first)).toBe('译：The first reply.')
+  expect(await chinese(last)).toBeUndefined()
+})
+
+test('a paragraph that failed says so, and /zh tries it again', async ($, on) => {
+  const failing = 'FAIL this paragraph.'
+  const w = world(on, {}, [{ role: 'user', text: 'Go', toolUses: [] }, { role: 'assistant', text: `Fine here.\n\n${failing}`, toolUses: [] }])
+  const ui = await $.ui.mount(reply(`Fine here.\n\n${failing}`))
+  await zh($)
+  await w.clock.settle()
+  expect(await chinese(ui)).toBe('译：Fine here.\n\n（这一段没翻译成功，再输入 /zh 重试）')
+  const asked = w.prompts.length
+  await zh($)
+  await w.clock.settle()
+  // Only the failed paragraph is asked for again, and the Chinese stays shown.
+  expect(w.prompts.length).toBe(asked + 1)
+  expect(await chinese(ui)).toContain('译：Fine here.')
+})
+
+test('/zh with no reply yet, or a bad argument, says so', async ($, on) => {
+  world(on, {}, [])
+  expect((await zh($)).text).toContain('No reply')
+  expect((await zh($, 'x')).text).toContain('Usage')
 })
 
 test('the check reads Claude\'s last reply as context', async ($, on) => {

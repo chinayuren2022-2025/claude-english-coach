@@ -1,6 +1,6 @@
 {
   "name": "english-coach",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Practise English by talking to Claude in English only: Chinese glosses on hard words, Chinese key points and translations of long replies, Chinese-to-English drafts, and a check of your English before you send.",
   "author": { "name": "chinayuren2022-2025", "url": "https://github.com/chinayuren2022-2025" },
   "repository": "https://github.com/chinayuren2022-2025/claude-english-coach",

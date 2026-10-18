@@ -666,6 +666,29 @@ test('while /zh shows the reply in Chinese, its key points give way', async ($, 
   expect(await ui.find({ text: POINTS.point })).toBeDefined()
 })
 
+// The desktop app draws a reply as its text alone in places, so there both go into the drawn text, as a quote under it.
+test('on the desktop the key points, then the Chinese, are drawn as a quote under the reply\'s text', async ($, on) => {
+  const w = world(on, {}, LONG_CONVO)
+  await $.ui.mount({ ...reply(LONG), surface: 'desktop' })
+  await endTurn($)
+  await w.clock.advance(400)
+  expect(w.drawn.at(-1)).toBe(
+    `${LONG}\n\n> **要点** · /zh 看全文中文\n> - **做了**　${POINTS.did}\n> - **结论**　${POINTS.point}\n> - **问你　${POINTS.ask}**`,
+  )
+  await zh($)
+  await w.clock.settle()
+  const shown = w.drawn.at(-1) ?? ''
+  expect(shown.startsWith(`${LONG}\n\n> **中文** · /zh hides it\n>\n> 译：When two requests`)).toBe(true)
+  expect(shown).toContain('\n>\n> 〔代码见上〕\n>\n> 译：Shall I add the lock now?')
+  expect(shown).not.toContain('要点')
+  await zh($)
+  await w.clock.settle()
+  expect(w.drawn.at(-1)).toContain(`> - **结论**　${POINTS.point}`)
+  // A block with nothing under it is drawn as Claude wrote it.
+  await $.ui.mount({ ...reply('Let me look.'), surface: 'desktop' })
+  expect(w.drawn.at(-1)).toBe('Let me look.')
+})
+
 test('the check reads Claude\'s last reply as context', async ($, on) => {
   const w = world(on)
   await submit($, 'Yes please, can you add it')

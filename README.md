@@ -57,6 +57,7 @@ Settings are kept across sessions.
 ## Notes
 
 - Where an organization manages Claude Code, the English-only system prompt part does not run for plugins a person installs; the input help still works.
+- In the desktop app, the `/zh` translation and the key points are drawn as a quote under the reply, still on screen only.
 - Develop: `claude --plugin-dir .` loads it from this folder; `claude plugin test .` runs the tests.
 
 ## License

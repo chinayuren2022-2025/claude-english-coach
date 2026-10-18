@@ -497,6 +497,17 @@ const pointsFor = (list: readonly ReplyPoints[], text: string) => {
   return [...list].reverse().find(p => p.paras.at(-1) === last && paras.every(q => p.paras.includes(q)))
 }
 
+// What goes under a reply, as markdown added to its text: the desktop draws a reply as its text alone
+// in places, where a tree of ours would be dropped.
+const quoted = (markdown: string) => markdown.split('\n').map(line => (line ? `> ${line}` : '>')).join('\n')
+
+const zhMarkdown = (zh: string) => quoted(`**中文** · /zh hides it\n\n${zh}`)
+
+const pointsMarkdown = (p: ReplyPoints['points']) => {
+  const rows = p ? [p.did && `- **做了**　${p.did}`, p.point && `- **结论**　${p.point}`, p.ask && `- **问你　${p.ask}**`] : ['…']
+  return quoted(['**要点** · /zh 看全文中文', ...rows.filter(Boolean)].join('\n'))
+}
+
 const HELP = async ($: EngineInterface, s: Settings) =>
   [
     `English coach is ${s.isOn ? 'on' : 'off'} · level ${await levelLabel($, s)} · goal ${s.goal} · glosses ${s.gloss ? 'on' : 'off'} · key points ${s.points ? 'on' : 'off'} · Chinese input: ${s.chinese} · feedback ${s.checkWhen}`,
@@ -949,8 +960,8 @@ export const register: Register = on => {
     return done
   })
 
-  // Draws a reply with its glosses and, under it, its Chinese after /zh or else the key points of a long one.
-  // The stored reply, which Claude reads, is unchanged.
+  // Draws a reply with its glosses and, under it, its Chinese after /zh or else the key points of a long one:
+  // a tree on the terminal, markdown added to the drawn text elsewhere. The stored reply, which Claude reads, is unchanged.
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
     if (e.props.isSummary) return next(e)
     seen.delete(e.requestId)
@@ -965,6 +976,10 @@ export const register: Register = on => {
     const zh = chineseFor(await read($, translations), e.props.text)
     const found = zh === null && s.isOn && s.points ? pointsFor(await read($, keyPoints), e.props.text) : undefined
     if (zh === null && found === undefined) return next(reply)
+    if (e.surface !== 'terminal') {
+      const under = zh !== null ? zhMarkdown(zh) : pointsMarkdown(found?.points ?? null)
+      return next({ ...reply, props: { ...reply.props, text: `${reply.props.text}\n\n${under}` } })
+    }
     const { Box, Markdown, Text } = $.ui.resolve(e)
     if (zh !== null)
       return (

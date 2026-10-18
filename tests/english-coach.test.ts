@@ -30,6 +30,8 @@ const BAND = {
 
 const SLIDER = { plugin: 'english-coach', component: 'SessionMode', props: { modes: [] } } as const
 
+const POINTS = { did: '读了 cache.ts，找到两次写入', point: '两个请求同时到达时缓存会被写两次', ask: '要不要现在加锁？' }
+
 const world = (on: On, store: Record<string, unknown> = {}, messages: unknown[] = [{ role: 'assistant', text: 'Shall I add a retry?', toolUses: [] }]) => {
   mock.store(on, store)
   const clock = mock.clock(on)
@@ -64,6 +66,10 @@ const world = (on: On, store: Record<string, unknown> = {}, messages: unknown[] 
       const para = e.prompt.split('Translate this paragraph:\n"""\n')[1]?.replace(/\n"""$/, '') ?? ''
       if (para.includes('FAIL')) return { value: { isAnswered: false, reason: 'api-error', status: 500 } as never }
       return { value: { isAnswered: true, usage: USAGE as never, text: `译：${para}` } }
+    }
+    if (e.system?.includes("the reply's key points")) {
+      const points = e.prompt.includes('Shall I') ? POINTS : { ...POINTS, ask: '' }
+      return { value: { isAnswered: true, usage: USAGE as never, text: JSON.stringify(points) } }
     }
     if (e.system?.includes('read an English reply')) {
       return { value: { isAnswered: true, usage: USAGE as never, text: '{"glosses": [{"term": "idempotent", "zh": "幂等的"}]}' } }
@@ -560,6 +566,104 @@ test('/zh with no reply yet, or a bad argument, says so', async ($, on) => {
   world(on, {}, [])
   expect((await zh($)).text).toContain('No reply')
   expect((await zh($, 'x')).text).toContain('Usage')
+})
+
+// A reply of just over 150 English words, the code in it not counted.
+const LONG = `${'When two requests arrive together, the cache is filled twice and the second write wins. '.repeat(10)}\n\n${CODE}\n\nShall I add the lock now?`
+const LONG_CONVO = [
+  { role: 'user', text: 'Why is the cache wrong?', toolUses: [] },
+  { role: 'assistant', text: 'Let me look.', toolUses: [] },
+  { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 't1', text: 'cache.ts', isError: false }] },
+  { role: 'assistant', text: LONG, toolUses: [] },
+]
+
+const endTurn = ($: Engine, extra = {}) =>
+  $.turn.complete({ answer: LONG, durationMs: 1, isAborted: false, turnId: 't1', reason: 'end_turn', ...extra } as never)
+
+const pointsAsked = (prompts: string[]) => prompts.filter(p => p.startsWith('The reply:')).length
+
+// find() gives the drawn tree that has the text; this is the element in it that holds the text itself.
+type Drawn = { props?: Record<string, unknown>; children?: (Drawn | string)[] }
+const holding = (node: unknown, text: string): Drawn | undefined => {
+  const n = node as Drawn | undefined
+  if (n?.children?.includes(text)) return n
+  for (const c of n?.children ?? []) {
+    const found = typeof c === 'string' ? undefined : holding(c, text)
+    if (found) return found
+  }
+  return undefined
+}
+
+test('a long reply gets its key points in Chinese under its last block, the question marked', async ($, on) => {
+  const w = world(on, {}, LONG_CONVO)
+  const last = await $.ui.mount(reply(LONG))
+  const before = await $.ui.mount(reply('Let me look.'))
+  await endTurn($)
+  await w.clock.advance(400)
+  expect(await last.find({ text: /要点/ })).toBeDefined()
+  expect(await last.find({ text: POINTS.did })).toBeDefined()
+  expect(await last.find({ text: POINTS.point })).toBeDefined()
+  const drawn = await last.find({ text: /问你/ })
+  expect(holding(drawn, '问你  ')?.props).toMatchObject({ color: 'yellow', bold: true })
+  expect(holding(drawn, POINTS.ask)?.props).toMatchObject({ color: 'yellow', bold: true })
+  expect(holding(drawn, POINTS.point)?.props?.color).toBeUndefined()
+  // Only the block that ends the reply has them, and Claude's English is drawn as it was.
+  expect(await before.find({ text: /要点/ })).toBeUndefined()
+  expect(new Set(w.drawn)).toEqual(new Set([LONG, 'Let me look.']))
+  // Haiku reads the whole reply, once, however often the reply is drawn or the turn ends.
+  expect(w.prompts.find(p => p.startsWith('The reply:'))).toContain('Let me look.')
+  await endTurn($)
+  await w.clock.advance(400)
+  expect(pointsAsked(w.prompts)).toBe(1)
+})
+
+test('no question in the reply, no 问你 line', async ($, on) => {
+  const text = LONG.replace('Shall I add the lock now?', 'The lock is in place now.')
+  const w = world(on, {}, [{ role: 'user', text: 'Fix it', toolUses: [] }, { role: 'assistant', text, toolUses: [] }])
+  const ui = await $.ui.mount(reply(text))
+  await endTurn($)
+  await w.clock.advance(400)
+  expect(await ui.find({ text: POINTS.point })).toBeDefined()
+  expect(await ui.find({ text: /问你/ })).toBeUndefined()
+})
+
+test('a short reply gets no key points', async ($, on) => {
+  const w = world(on, {}, CONVO)
+  const ui = await $.ui.mount(reply(LAST))
+  await endTurn($)
+  await w.clock.advance(400)
+  expect(await ui.find({ text: /要点/ })).toBeUndefined()
+  expect(pointsAsked(w.prompts)).toBe(0)
+})
+
+test('an interrupted reply gets no key points', async ($, on) => {
+  const w = world(on, {}, LONG_CONVO)
+  await endTurn($, { isAborted: true })
+  await w.clock.advance(400)
+  expect(pointsAsked(w.prompts)).toBe(0)
+})
+
+test('/english points off: none made, and those made are hidden', async ($, on) => {
+  const w = world(on, {}, LONG_CONVO)
+  const ui = await $.ui.mount(reply(LONG))
+  await endTurn($)
+  await w.clock.advance(400)
+  const r = (await $.command.run({ command: 'english', args: 'points off', origin: { kind: 'composer' } } as never)) as { text: string }
+  expect(r.text).toContain('key points off')
+  expect(await ui.find({ text: /要点/ })).toBeUndefined()
+})
+
+test('while /zh shows the reply in Chinese, its key points give way', async ($, on) => {
+  const w = world(on, {}, LONG_CONVO)
+  const ui = await $.ui.mount(reply(LONG))
+  await endTurn($)
+  await w.clock.advance(400)
+  await zh($)
+  await w.clock.settle()
+  expect(await chinese(ui)).toContain('译：Shall I add the lock now?')
+  expect(await ui.find({ text: /要点/ })).toBeUndefined()
+  await zh($)
+  expect(await ui.find({ text: POINTS.point })).toBeDefined()
 })
 
 test('the check reads Claude\'s last reply as context', async ($, on) => {

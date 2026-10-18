@@ -1,12 +1,13 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PromptOrigin, Register, RenderChildren, SessionMessage } from 'claude-code'
 
-import type { Feedback, Gloss, LevelView, Phrase, ReplyGlosses, ReplyTranslation } from '../types'
+import type { Feedback, Gloss, LevelView, Phrase, ReplyGlosses, ReplyPoints, ReplyTranslation } from '../types'
 
 const feedback = atom({ plugin: 'english-coach', key: 'feedback' } as const, null)
 const levelView = atom({ plugin: 'english-coach', key: 'level' } as const, null)
 const replyGlosses = atom({ plugin: 'english-coach', key: 'glosses' } as const, {} as ReplyGlosses)
 const translations = atom({ plugin: 'english-coach', key: 'translations' } as const, [] as ReplyTranslation[])
+const keyPoints = atom({ plugin: 'english-coach', key: 'points' } as const, [] as ReplyPoints[])
 
 // Glosses per reply: at most this many replies kept, this many new blocks glossed per turn.
 const GLOSSED_KEPT = 100
@@ -26,9 +27,11 @@ type Settings = {
   gloss: boolean
   chinese: ChineseMode
   checkWhen: CheckWhen
+  // Key points in Chinese under Claude's long replies.
+  points: boolean
 }
 
-const DEFAULTS: Settings = { isOn: true, level: 'auto', goal: 'IELTS 7.5', gloss: true, chinese: 'review', checkWhen: 'before' }
+const DEFAULTS: Settings = { isOn: true, level: 'auto', goal: 'IELTS 7.5', gloss: true, chinese: 'review', checkWhen: 'before', points: true }
 
 // Prefix that sends a prompt as typed, Chinese included.
 const RAW_PREFIX = 'zh:'
@@ -386,7 +389,7 @@ export const repliesOf = (messages: readonly SessionMessage[]) => {
   return out
 }
 
-const sameReply = (t: ReplyTranslation, paras: string[]) => t.paras.length === paras.length && t.paras.every((p, i) => p === paras[i])
+const sameReply = (t: { paras: string[] }, paras: string[]) => t.paras.length === paras.length && t.paras.every((p, i) => p === paras[i])
 
 const translatePara = async ($: EngineInterface, para: string, before: string) => {
   const r = await $.model.complete({
@@ -447,15 +450,63 @@ const chineseFor = (list: readonly ReplyTranslation[], text: string): string | n
   return null
 }
 
+// A reply this long, in English words outside code, gets key points under it; this many replies are kept.
+const POINTS_MIN_WORDS = 150
+const POINTS_KEPT = 20
+
+const makePoints = async ($: EngineInterface, reply: string) => {
+  // What was done comes first in a reply and the question last, so a very long one keeps both ends.
+  const text = reply.length > 12_000 ? `${reply.slice(0, 3_000)}\n\n[…]\n\n${reply.slice(-9_000)}` : reply
+  const json = await ask(
+    $,
+    `You help a Chinese-speaking developer, who reads long English slowly, follow a reply that Claude, an AI coding assistant, wrote to them. ` +
+      `Give the reply's key points in Simplified Chinese, so they know what it says before reading it all. ` +
+      `"did": what Claude did in this turn (files changed, commands run, tests and their results), in one sentence; empty if it only explained or answered. ` +
+      `"point": the reply's main conclusion, answer or recommendation, in one sentence. ` +
+      `"ask": the question Claude asks them, or the decision or action it needs from them, in one sentence; empty if the reply asks nothing, and never make one up. ` +
+      `Each one short sentence under 50 characters: only what matters most, plain text, no markdown. Keep file names, commands, identifiers and numbers as they are, and technical terms in English where a Chinese developer would. ` +
+      `Say only what the reply says. Reply with JSON only: {"did": "<中文>", "point": "<中文>", "ask": "<中文>"}`,
+    `The reply:\n"""\n${text}\n"""`,
+    30_000,
+  )
+  const str = (v: unknown) => (typeof v === 'string' ? v.trim() : '')
+  const points = { did: str(json?.did), point: str(json?.point), ask: str(json?.ask) }
+  return points.did || points.point || points.ask ? points : null
+}
+
+// Key points for Claude's last reply, if it is long and has none yet.
+const pointLastReply = async ($: EngineInterface) => {
+  const s = await loadSettings($)
+  if (!s.isOn || !s.points) return
+  const reply = repliesOf(await $.session.messages()).at(-1)
+  if (reply === undefined || wordCount(reply) < POINTS_MIN_WORDS) return
+  const paras = paragraphs(reply)
+  if ((await read($, keyPoints)).some(p => sameReply(p, paras))) return
+  await update($, keyPoints, all => [...all, { paras, points: null }].slice(-POINTS_KEPT))
+  const points = await makePoints($, reply)
+  // Nothing is drawn for a reply Haiku could not read.
+  await update($, keyPoints, all =>
+    points ? all.map(p => (sameReply(p, paras) ? { ...p, points } : p)) : all.filter(p => !sameReply(p, paras)),
+  )
+}
+
+// The key points drawn under a reply block: those of the reply the block ends.
+const pointsFor = (list: readonly ReplyPoints[], text: string) => {
+  const paras = paragraphs(text)
+  const last = paras.at(-1)
+  return [...list].reverse().find(p => p.paras.at(-1) === last && paras.every(q => p.paras.includes(q)))
+}
+
 const HELP = async ($: EngineInterface, s: Settings) =>
   [
-    `English coach is ${s.isOn ? 'on' : 'off'} · level ${await levelLabel($, s)} · goal ${s.goal} · glosses ${s.gloss ? 'on' : 'off'} · Chinese input: ${s.chinese} · feedback ${s.checkWhen}`,
+    `English coach is ${s.isOn ? 'on' : 'off'} · level ${await levelLabel($, s)} · goal ${s.goal} · glosses ${s.gloss ? 'on' : 'off'} · key points ${s.points ? 'on' : 'off'} · Chinese input: ${s.chinese} · feedback ${s.checkWhen}`,
     ``,
     `/english on | off              turn the mode on or off`,
     `/english level auto            measure your level from what you write (default)`,
     `/english level A2|B1|B2|C1     fix the level of Claude's English`,
     `/english goal <text>           your target, e.g. IELTS 7.5`,
     `/english gloss on|off          Chinese glosses after hard words`,
+    `/english points on|off         key points in Chinese under Claude's long replies`,
     `/english chinese review        Chinese input becomes an English draft in the box for you to check (default)`,
     `/english chinese auto          Chinese input is translated and sent at once`,
     `/english chinese off           Chinese input is sent as typed`,
@@ -493,6 +544,7 @@ const applyArgs = (s: Settings, args: string): Settings | string => {
     return goal ? { ...s, goal } : 'Give a goal, e.g. /english goal IELTS 7.5'
   }
   if (key === 'gloss' && flag !== undefined) return { ...s, gloss: flag }
+  if (key === 'points' && flag !== undefined) return { ...s, points: flag }
   if (key === 'feedback') {
     const when = value === 'on' ? 'before' : value
     if (when === 'before' || when === 'after' || when === 'off') return { ...s, checkWhen: when }
@@ -617,6 +669,8 @@ export const register: Register = on => {
     if (typeof changed === 'string') return { text: `${changed}\n\n${await HELP($, s)}` }
     await saveSettings($, changed)
     if (!changed.isOn) await update($, feedback, () => null)
+    // Settings are not state a drawn reply follows, so points already drawn go with the points made.
+    if (!changed.isOn || !changed.points) await update($, keyPoints, () => [])
     return { text: (await HELP($, changed)).split('\n')[0] ?? '' }
   })
 
@@ -888,14 +942,15 @@ export const register: Register = on => {
     )
   })
 
-  // Glosses are made once the turn's reply is whole, off the dispatch.
+  // Glosses and key points are made once the turn's reply is whole, off the dispatch.
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
-    if (e.agentId === undefined) $.clock.after(300, () => void glossNewBlocks($))
+    if (e.agentId === undefined) $.clock.after(300, () => void Promise.all([glossNewBlocks($), e.isAborted ? null : pointLastReply($)]))
     return done
   })
 
-  // Draws a reply with its glosses and, after /zh, its Chinese under it; the stored reply, which Claude reads, is unchanged.
+  // Draws a reply with its glosses and, under it, its Chinese after /zh or else the key points of a long one.
+  // The stored reply, which Claude reads, is unchanged.
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
     if (e.props.isSummary) return next(e)
     seen.delete(e.requestId)
@@ -908,14 +963,45 @@ export const register: Register = on => {
     const reply = isGlossed && made ? { ...e, props: { ...e.props, text: applyGlosses(e.props.text, made.glosses) } } : e
 
     const zh = chineseFor(await read($, translations), e.props.text)
-    if (zh === null) return next(reply)
+    const found = zh === null && s.isOn && s.points ? pointsFor(await read($, keyPoints), e.props.text) : undefined
+    if (zh === null && found === undefined) return next(reply)
     const { Box, Markdown, Text } = $.ui.resolve(e)
+    if (zh !== null)
+      return (
+        <Box key="with-zh" flexDirection="column">
+          {await next(reply)}
+          <Box key="zh" flexDirection="column" paddingLeft={2}>
+            <Text dimColor>── 中文 · /zh hides it ──</Text>
+            <Markdown key="zh-text" text={zh} dimColor />
+          </Box>
+        </Box>
+      )
+    const p = found?.points
+    // The label and its text side by side, so a long line wraps under its text; the question stands out.
+    const row = (key: string, label: string, text: string) => {
+      const look = key === 'ask' ? { color: 'yellow', bold: true } : {}
+      return text ? (
+        <Box key={key}>
+          <Text {...look} dimColor={key !== 'ask'}>{`${label}  `}</Text>
+          <Text {...look}>{text}</Text>
+        </Box>
+      ) : null
+    }
     return (
-      <Box key="with-zh" flexDirection="column">
+      <Box key="with-points" flexDirection="column">
         {await next(reply)}
-        <Box key="zh" flexDirection="column" paddingLeft={2}>
-          <Text dimColor>── 中文 · /zh hides it ──</Text>
-          <Markdown key="zh-text" text={zh} dimColor />
+        <Box key="points" flexDirection="column" paddingLeft={2}>
+          <Text>
+            <Text color="cyan">── 要点 </Text>
+            <Text dimColor>· /zh 看全文中文 ──</Text>
+          </Text>
+          {p ? (
+            [row('did', '做了', p.did), row('point', '结论', p.point), row('ask', '问你', p.ask)]
+          ) : (
+            <Text key="reading" dimColor>
+              …
+            </Text>
+          )}
         </Box>
       </Box>
     )

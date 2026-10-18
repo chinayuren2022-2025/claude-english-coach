@@ -13,8 +13,9 @@ Practise English by working with Claude in English only. Made for Chinese-speaki
 - **Level up.** Even when your English is natural, you get one stronger word or phrase toward your goal: `fix this bug → track down this bug`.
 - **Write in Chinese when you're stuck.** Chinese or mixed input becomes an English draft in the box for you to check, with the key phrases shown: `优化 → optimize`. Click **↩ 中文** on the card (or type **`**) to get your Chinese back, and Enter sends it as typed; **→ English** brings the draft back. Chinese in file references (`@笔记.md`, paths, file names) and in quotes doesn't count, so an English message about a Chinese-named file is checked as English. Start a prompt with `zh:` to send Chinese as typed.
 - **Read a long reply in Chinese.** `/zh` has Haiku translate Claude's last reply into Chinese and draws it under the English, paragraph by paragraph, so you can compare the two. Code stays as it is, and technical terms keep their English: `竞态条件（race condition）`. `/zh` again hides it; `/zh 2` translates the reply before. Only you see it: the Chinese is drawn on screen and never written to the conversation, so Claude's context doesn't grow and Claude keeps replying in English.
+- **Key points of a long reply.** When Claude writes more than about 150 words, up to three short Chinese lines appear under the reply: **做了**, what Claude did (files changed, commands run, test results); **结论**, its conclusion or advice; and, in yellow, **问你**, the question it asks you or what it needs from you, shown only when there is one. So you know what a long reply says, and what you have to answer, before you read it all. While `/zh` shows the full translation, the key points give way to it. Like `/zh`, they are only drawn on screen and never written to the conversation. `/english points off` turns them off.
 
-The checks, drafts, glosses and translations use a small, fast model (Haiku): one call per message you send, one per reply block Claude writes (at most 6 per turn), and one per paragraph you translate with `/zh`.
+The checks, drafts, glosses, translations and key points use a small, fast model (Haiku): one call per message you send, one per reply block Claude writes (at most 6 per turn), one per paragraph you translate with `/zh`, and one per long reply for its key points.
 
 ## Install
 
@@ -44,6 +45,7 @@ In the desktop app, where `/plugin` does not run: click **+** next to the prompt
 | `/english level A2\|B1\|B2\|C1` | Fix the level of Claude's English |
 | `/english goal IELTS 7.5` | Set your target |
 | `/english gloss on\|off` | Chinese glosses after hard words |
+| `/english points on\|off` | Key points in Chinese under Claude's long replies |
 | `/english feedback before\|after\|off` | Check before sending (default), feedback after sending, or none |
 | `/english chinese review\|auto\|off` | Chinese input: draft to check (default), translate and send, or send as typed |
 | `/english demo` | Show a sample feedback card |

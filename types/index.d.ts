@@ -51,6 +51,15 @@ export type ReplyTranslation = {
   isShown: boolean
 }
 
+// The key points of one of Claude's long replies, in Chinese, drawn under it for the person alone.
+export type ReplyPoints = {
+  // The reply's paragraphs as Claude wrote them.
+  paras: string[]
+  // What Claude did, what it concluded, what it asks of the person: '' for one the reply has not.
+  // null while Haiku reads the reply.
+  points: { did: string; point: string; ask: string } | null
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'english-coach': {
@@ -59,6 +68,8 @@ declare module 'claude-code' {
       glosses: ReplyGlosses
       // The replies /zh translated, newest last.
       translations: ReplyTranslation[]
+      // The long replies given key points, newest last.
+      points: ReplyPoints[]
     }
   }
 }
